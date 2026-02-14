@@ -326,11 +326,11 @@ When you run the deployer, it executes these steps in order:
 
 Each step is timed and reported. The full deployment typically takes a few hours depending on bundle download speeds and environment performance. You can safely interrupt with `Ctrl+C` — the deployer handles graceful shutdown.
 
-Most of my deployments take around 2 hours and 30 minutes. (Tested on physical SDDC vSphere 8u3+ Cluster with 4 hosts & NSX 4.2 & vSAN OSA on NVMe storage)
+Most of my deployments take around 2 hours and 30 minutes. (Tested on physical SDDC vSphere 8u3+ VSAN OSA Cluster with 4 hosts & NVMe Storage + NSX 4.2)
 
 ## Screenshots
 
-Launching the deployment
+Deployment initialization
 
 ![zpod-vcf-deployer-1.png](img/zpod-vcf-deployer-1.png)
 
@@ -342,6 +342,12 @@ Deployment progress live global milestones/tasks status
 
 ![zpod-vcf-deployer-3.png](img/zpod-vcf-deployer-3.png)
 
-Deployement completion
+Deployment completion
 
 ![zpod-vcf-deployer-4.png](img/zpod-vcf-deployer-4.png)
+
+## Screencast
+
+Because screencasts are beautiful !
+
+<a href="https://asciinema.org/a/xRhaXddDXgdSCkt3" target="_blank"><img src="https://asciinema.org/a/xRhaXddDXgdSCkt3.svg" /></a>
