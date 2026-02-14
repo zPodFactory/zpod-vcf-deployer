@@ -1,0 +1,32 @@
+# zPod VCF Deployer Environment Configuration
+# Rename this file to .env and update values as needed
+
+# zPodFactory Configuration
+ZPODFACTORY_DEFAULT_ENDPOINT=your-endpoint-name
+ZPODFACTORY_ACCESS_TOKEN=your-access-token
+ZPODFACTORY_BASE_URL=http://zpodfactory.example.com:8000
+
+# VCF Template and Profile
+VCF_JSON_TEMPLATE=config/v902_std_3hosts.json
+ZPODFACTORY_DEFAULT_PROFILE=vcf-902-3hosts
+
+# VCF Depot Configuration
+# Choose between "online" or "offline"
+VCF_DEPOT_MODE=offline
+
+# VCF Online Depot Configuration (when VCF_DEPOT_MODE=online)
+VCF_ONLINE_DEPOT_DOWNLOAD_TOKEN=your-vmware-download-token
+
+
+# Documentation to build offline depot 
+# - https://github.com/tsugliani/doc-vcf-offlinedepot
+
+# VCF Offline Depot Configuration (when VCF_DEPOT_MODE=offline)
+VCF_OFFLINE_DEPOT_HOSTNAME=offlinedepot.corp.com
+VCF_OFFLINE_DEPOT_USERNAME=username
+VCF_OFFLINE_DEPOT_PASSWORD=password
+VCF_OFFLINE_DEPOT_PORT=443
+
+# VCF Configuration (optional, has defaults)
+VCF_SKU=VCF
+VCF_VERSION=9.0.2.0

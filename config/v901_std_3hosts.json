@@ -1,0 +1,269 @@
+{
+    "sddcId": "mgmt-domain",
+    "vcfInstanceName": "vcf-{{zpod_name}}",
+    "workflowType": "VCF",
+    "version": "9.0.1.0",
+    "skipEsxThumbprintValidation": true,
+    "ceipEnabled": true,
+    "dnsSpec": {
+        "nameservers": [
+            "{{zpod_subnet}}.2"
+        ],
+        "subdomain": "{{zpod_domain}}"
+    },
+    "ntpServers": [
+        "{{zpodfactory_ip}}"
+    ],
+    "vcenterSpec": {
+        "vcenterHostname": "vcsa.{{zpod_domain}}",
+        "rootVcenterPassword": "{{zpod_password}}",
+        "vmSize": "small",
+        "storageSize": "",
+        "adminUserSsoPassword": "{{zpod_password}}",
+        "ssoDomain": "{{zpod_domain}}",
+        "useExistingDeployment": false
+    },
+    "clusterSpec": {
+        "clusterName": "Cluster",
+        "datacenterName": "Datacenter"
+    },
+    "datastoreSpec": {
+        "vsanSpec": {
+            "failuresToTolerate": 0,
+            "vsanDedup": false,
+            "esaConfig": {
+                "enabled": false
+            },
+            "datastoreName": "vsanDatastore"
+        }
+    },
+    "nsxtSpec": {
+        "nsxtManagerSize": "medium",
+        "nsxtManagers": [
+            {
+                "hostname": "nsx21.{{zpod_domain}}"
+            }
+        ],
+        "vipFqdn": "nsx.{{zpod_domain}}",
+        "useExistingDeployment": false,
+        "nsxtAdminPassword": "{{zpod_password}}",
+        "nsxtAuditPassword": "{{zpod_password}}",
+        "rootNsxtManagerPassword": "{{zpod_password}}",
+        "skipNsxOverlayOverManagementNetwork": true,
+        "ipAddressPoolSpec": {
+            "name": "vcf-np-nsx-tep",
+            "description": "VCF Network Pool for NSX Teps",
+            "subnets": [
+                {
+                    "cidr": "172.16.30.0/24",
+                    "gateway": "172.16.30.1",
+                    "ipAddressPoolRanges": [
+                        {
+                            "start": "172.16.30.11",
+                            "end": "172.16.30.50"
+                        }
+                    ]
+                }
+            ]
+        },
+        "transportVlanId": "30"
+    },
+    "vcfOperationsSpec": {
+        "nodes": [
+            {
+                "hostname": "vcfops.{{zpod_domain}}",
+                "rootUserPassword": "{{zpod_password}}",
+                "type": "master"
+            }
+        ],
+        "adminUserPassword": "{{zpod_password}}",
+        "applianceSize": "small",
+        "useExistingDeployment": false,
+        "loadBalancerFqdn": null
+    },
+    "vcfOperationsFleetManagementSpec": {
+        "hostname": "vcfopsfleetmgr.{{zpod_domain}}",
+        "rootUserPassword": "{{zpod_password}}",
+        "adminUserPassword": "{{zpod_password}}",
+        "useExistingDeployment": false
+    },
+    "vcfOperationsCollectorSpec": {
+        "hostname": "vcfopscollector.{{zpod_domain}}",
+        "applicationSize": "small",
+        "rootUserPassword": "{{zpod_password}}",
+        "useExistingDeployment": false
+    },
+    "hostSpecs": [
+        {
+            "hostname": "esxi11.{{zpod_domain}}",
+            "credentials": {
+                "username": "root",
+                "password": "{{zpod_password}}"
+            }
+        },
+        {
+            "hostname": "esxi12.{{zpod_domain}}",
+            "credentials": {
+                "username": "root",
+                "password": "{{zpod_password}}"
+            }
+        },
+        {
+            "hostname": "esxi13.{{zpod_domain}}",
+            "credentials": {
+                "username": "root",
+                "password": "{{zpod_password}}"
+            }
+        }
+    ],
+    "networkSpecs": [
+        {
+            "networkType": "MANAGEMENT",
+            "subnet": "{{zpod_subnet}}.0/26",
+            "gateway": "{{zpod_subnet}}.1",
+            "subnetMask": null,
+            "includeIpAddress": null,
+            "includeIpAddressRanges": null,
+            "vlanId": "0",
+            "mtu": 1500,
+            "teamingPolicy": "loadbalance_loadbased",
+            "activeUplinks": [
+                "uplink1",
+                "uplink2"
+            ],
+            "standbyUplinks": [],
+            "portGroupKey": "pg-esx-mgmt"
+        },
+        {
+            "networkType": "VM_MANAGEMENT",
+            "subnet": "{{zpod_subnet}}.0/26",
+            "gateway": "{{zpod_subnet}}.1",
+            "subnetMask": null,
+            "includeIpAddress": null,
+            "includeIpAddressRanges": null,
+            "vlanId": "0",
+            "mtu": 1500,
+            "teamingPolicy": "loadbalance_loadbased",
+            "activeUplinks": [
+                "uplink1",
+                "uplink2"
+            ],
+            "standbyUplinks": [],
+            "portGroupKey": "pg-vm-mgmt"
+        },
+        {
+            "networkType": "VMOTION",
+            "subnet": "172.16.10.0/24",
+            "gateway": "172.16.10.1",
+            "subnetMask": null,
+            "includeIpAddress": null,
+            "includeIpAddressRanges": [
+                {
+                    "startIpAddress": "172.16.10.11",
+                    "endIpAddress": "172.16.10.50"
+                }
+            ],
+            "vlanId": "10",
+            "mtu": "8000",
+            "teamingPolicy": "loadbalance_loadbased",
+            "activeUplinks": [
+                "uplink1",
+                "uplink2"
+            ],
+            "standbyUplinks": [],
+            "portGroupKey": "pg-vmotion"
+        },
+        {
+            "networkType": "VSAN",
+            "subnet": "172.16.20.0/24",
+            "gateway": "172.16.20.1",
+            "subnetMask": null,
+            "includeIpAddress": null,
+            "includeIpAddressRanges": [
+                {
+                    "startIpAddress": "172.16.20.11",
+                    "endIpAddress": "172.16.20.50"
+                }
+            ],
+            "vlanId": "20",
+            "mtu": "8000",
+            "teamingPolicy": "loadbalance_loadbased",
+            "activeUplinks": [
+                "uplink1",
+                "uplink2"
+            ],
+            "standbyUplinks": [],
+            "portGroupKey": "pg-vsan"
+        }
+    ],
+    "dvsSpecs": [
+        {
+            "dvsName": "vds-mgmt",
+            "networks": [
+                "MANAGEMENT",
+                "VM_MANAGEMENT",
+                "VMOTION",
+                "VSAN"
+            ],
+            "mtu": "8000",
+            "nsxtSwitchConfig": null,
+            "vmnicsToUplinks": [
+                {
+                    "id": "vmnic0",
+                    "uplink": "uplink1"
+                },
+                {
+                    "id": "vmnic1",
+                    "uplink": "uplink2"
+                }
+            ],
+            "nsxTeamings": null,
+            "lagSpecs": null
+        },
+        {
+            "dvsName": "vds-nsx",
+            "networks": null,
+            "mtu": "8000",
+            "nsxtSwitchConfig": {
+                "transportZones": [
+                    {
+                        "name": "mgmt-domain-tz-overlay",
+                        "transportType": "OVERLAY"
+                    },
+                    {
+                        "name": "mgmt-domain-tz-vlan",
+                        "transportType": "VLAN"
+                    }
+                ]
+            },
+            "vmnicsToUplinks": [
+                {
+                    "id": "vmnic2",
+                    "uplink": "uplink1"
+                },
+                {
+                    "id": "vmnic3",
+                    "uplink": "uplink2"
+                }
+            ],
+            "nsxTeamings": [
+                {
+                    "policy": "LOADBALANCE_SRCID",
+                    "activeUplinks": [
+                        "uplink1",
+                        "uplink2"
+                    ],
+                    "standByUplinks": []
+                }
+            ],
+            "lagSpecs": null
+        }
+    ],
+    "sddcManagerSpec": {
+        "hostname": "sddcmgr.{{zpod_domain}}",
+        "useExistingDeployment": false,
+        "rootPassword": "{{zpod_password}}",
+        "sshPassword": "{{zpod_password}}",
+        "localUserPassword": "{{zpod_password}}"
+    }
+}
