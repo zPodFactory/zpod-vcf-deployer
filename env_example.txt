@@ -8,7 +8,7 @@ ZPODFACTORY_BASE_URL=http://zpodfactory.example.com:8000
 
 # VCF Template and Profile
 VCF_JSON_TEMPLATE=config/v902_std_3hosts.json
-ZPODFACTORY_DEFAULT_PROFILE=vcf9-mgmt-3nodes
+ZPODFACTORY_DEFAULT_PROFILE=vcf-902-3hosts
 
 # VCF Depot Configuration
 # Choose between "online" or "offline"
