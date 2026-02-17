@@ -62,7 +62,7 @@ All settings can be configured in a `.env` file (loaded automatically) or passed
 | `ZPODFACTORY_BASE_URL` | zPodFactory API URL (e.g. `http://zpodfactory.example.com:8000`) |
 | `ZPODFACTORY_ACCESS_TOKEN` | Your zPodFactory API access token |
 | `ZPODFACTORY_DEFAULT_ENDPOINT` | zPodFactory endpoint name to deploy on |
-| `ZPODFACTORY_DEFAULT_PROFILE` | zPod profile to use (e.g. `vcf9-mgmt-3nodes`) |
+| `ZPODFACTORY_DEFAULT_PROFILE` | zPod profile to use (e.g. `vcf-902-3hosts`) |
 
 ### VCF Template (required)
 
@@ -105,7 +105,7 @@ All settings can be configured in a `.env` file (loaded automatically) or passed
 ZPODFACTORY_DEFAULT_ENDPOINT=my-endpoint
 ZPODFACTORY_ACCESS_TOKEN=my-access-token
 ZPODFACTORY_BASE_URL=http://zpodfactory.example.com:8000
-ZPODFACTORY_DEFAULT_PROFILE=vcf9-mgmt-3nodes
+ZPODFACTORY_DEFAULT_PROFILE=vcf-902-3hosts
 
 # VCF Template
 VCF_JSON_TEMPLATE=config/v902_std_3hosts.json
@@ -147,9 +147,9 @@ Any `.env` setting can be overridden on the command line:
 
 ```bash
 uv run zpod-vcf-deployer.py -n demo \
-  --vcf-json-template config/v902_std_3hosts.json \
-  --zpodfactory-profile vcf9-mgmt-3nodes \
-  --vcf-version 9.0.2.0
+  --vcf-json-template config/v901_std_3hosts.json \
+  --zpodfactory-profile vcf-901-3hosts \
+  --vcf-version 9.0.1.0
 ```
 
 ### Help
@@ -167,7 +167,7 @@ uv run zpod-vcf-deployer.py --help
  uv run zpod-vcf-deployer.py \
    --vcf-json-template config/v902_std_3hosts.json \
    --zpod-name my-zpod \
-   --zpodfactory-profile vcf \
+   --zpodfactory-profile vcf-902-3hosts \
    --zpodfactory-endpoint my-endpoint \
    --zpodfactory-access-token your-token \
    --zpodfactory-base-url http://zpodfactory.example.com:8000 \
@@ -178,7 +178,7 @@ uv run zpod-vcf-deployer.py --help
  uv run zpod-vcf-deployer.py \
    --vcf-json-template config/v902_std_3hosts.json \
    --zpod-name my-zpod \
-   --zpodfactory-profile vcf \
+   --zpodfactory-profile vcf-902-3hosts \
    --zpodfactory-endpoint my-endpoint \
    --zpodfactory-access-token your-token \
    --zpodfactory-base-url http://zpodfactory.example.com:8000 \
@@ -246,12 +246,12 @@ Templates are Jinja2-enabled JSON files. Variables like `{{zpod_name}}`, `{{zpod
 Those VCF templates match zPodFactory profiles, here is a sample one used for small deployments
 
 ```
-$ just zcli profile info vcf9-mgmt-3nodes
+$ just zcli profile info vcf-902-3hosts
                                            Profile Info
 ┏━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
 ┃ Name             ┃ Components                                                                   ┃
 ┡━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
-│ vcf9-mgmt-3nodes │ zbox-12.11                                                                   │
+│ vcf-902-3hosts   │ zbox-12.11                                                                   │
 │                  │ esxi-9.0.2.0 (Host Id: 11, CPU: 16, Mem: 128GB, NICs: 4, Disks: 40GB, 800GB) │
 │                  │ esxi-9.0.2.0 (Host Id: 12, CPU: 16, Mem: 128GB, NICs: 4, Disks: 40GB, 800GB) │
 │                  │ esxi-9.0.2.0 (Host Id: 13, CPU: 16, Mem: 128GB, NICs: 4, Disks: 40GB, 800GB) │
@@ -262,7 +262,7 @@ $ just zcli profile info vcf9-mgmt-3nodes
 Sample zPodFactory profile json template specification used:
 
 ```
-$ just zcli profile info vcf9-mgmt-3nodes -j 
+$ just zcli profile info vcf-902-3hosts -j 
 [
   {
     "component_uid": "zbox-12.11"
