@@ -2540,38 +2540,41 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
 
 
 def get_sorted_milestone_subtasks(all_subtasks, n=10):
-    # Partition subtasks by whether they have a timestamp
-    with_ts = [s for s in all_subtasks if s.get("updateTimestamp")]
-    no_ts = [s for s in all_subtasks if not s.get("updateTimestamp")]
+    # Show a window of n subtasks around the current activity point.
+    # The subtask list is sequential — tasks progress from INITIALIZED →
+    # IN_PROGRESS → completed. We find the activity point and show a
+    # window centered around it to stay within the current milestone scope.
 
-    # If all have no timestamp, put IN_PROGRESS first, then the rest
-    if not with_ts:
-        in_progress = [s for s in no_ts if s.get("status", "") == "IN_PROGRESS"]
-        others = [s for s in no_ts if s not in in_progress]
-        sorted_subtasks = in_progress + others
-        return sorted_subtasks[:n]
-    else:
-        # Sort with timestamps by timestamp
-        with_ts_sorted = sorted(with_ts, key=lambda s: s.get("updateTimestamp"))
-        # Keep no-timestamp tasks in their original order after the completed ones
-        sorted_subtasks = with_ts_sorted + no_ts
-        last_n = sorted_subtasks[-n:]
-        # Ensure the IN_PROGRESS task is always present in the last N
-        in_progress = next(
-            (s for s in all_subtasks if s.get("status", "") == "IN_PROGRESS"), None
-        )
-        if in_progress and in_progress not in last_n:
-            # Replace the first item with the IN_PROGRESS task
-            last_n = [in_progress] + last_n[1:]
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_last_n = []
-        for s in last_n:
-            sid = id(s)
-            if sid not in seen:
-                unique_last_n.append(s)
-                seen.add(sid)
-        return unique_last_n
+    if not all_subtasks:
+        return []
+
+    # Find the IN_PROGRESS task index as our anchor point
+    anchor_idx = None
+    for i, s in enumerate(all_subtasks):
+        if s.get("status", "") == "IN_PROGRESS":
+            anchor_idx = i
+            break
+
+    # If no IN_PROGRESS task, find the first INITIALIZED task (next up)
+    if anchor_idx is None:
+        for i, s in enumerate(all_subtasks):
+            if s.get("status", "") == "INITIALIZED":
+                anchor_idx = i
+                break
+
+    # If still no anchor (all completed), show the last n
+    if anchor_idx is None:
+        return all_subtasks[-n:]
+
+    # Show a window: a few completed tasks before the anchor, then forward
+    context_before = 3
+    start = max(0, anchor_idx - context_before)
+    end = min(len(all_subtasks), start + n)
+    # Adjust start if we're near the end of the list
+    if end - start < n:
+        start = max(0, end - n)
+
+    return all_subtasks[start:end]
 
 
 if __name__ == "__main__":
