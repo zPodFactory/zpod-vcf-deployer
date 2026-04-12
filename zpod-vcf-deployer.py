@@ -1585,8 +1585,8 @@ def get_required_components(vcf_json: dict) -> set:
         "vcfOperationsSpec": ["VROPS", "VCF_OPS_CLOUD_PROXY"],
         "vcfOperationsFleetManagementSpec": ["VRSLCM"],
         "vcfOperationsCollectorSpec": ["VROPS"],
+        "vcfAutomationSpec": ["VRA"],
         # FIXME: VRA and VRLI spec key names are unknown, update once confirmed
-        "UNKNOWN_VRA_SPEC": ["VRA"],
         "UNKNOWN_VRLI_SPEC": ["VRLI"],
     }
 
