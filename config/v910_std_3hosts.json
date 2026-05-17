@@ -1,0 +1,287 @@
+{
+  "sddcId": "mgmt-domain",
+  "vcfInstanceName": "vcf-{{zpod_name}}",
+  "workflowType": "VCF",
+  "version": "9.1.0.0",
+  "skipEsxThumbprintValidation": true,
+  "ceipEnabled": false,
+  "hostSpecs": [
+    {
+      "hostname": "esxi11.{{zpod_domain}}",
+      "credentials": {
+        "username": "root",
+        "password": "{{zpod_password}}"
+      }
+    },
+    {
+      "hostname": "esxi12.{{zpod_domain}}",
+      "credentials": {
+        "username": "root",
+        "password": "{{zpod_password}}"
+      }
+    },
+    {
+      "hostname": "esxi13.{{zpod_domain}}",
+      "credentials": {
+        "username": "root",
+        "password": "{{zpod_password}}"
+      }
+    }
+  ],
+  "vcenterSpec": {
+    "vcenterHostname": "vcsa.{{zpod_domain}}",
+    "rootVcenterPassword": "{{zpod_password}}",
+    "vmSize": "small",
+    "storageSize": "lstorage",
+    "ssoDomain": "{{zpod_domain}}",
+    "adminUserSsoPassword": "{{zpod_password}}",
+    "version": "9.1.0.0.25370922",
+    "useExistingDeployment": false
+  },
+  "clusterSpec": {
+    "datacenterName": "mgmt-domain-dc01",
+    "clusterName": "mgmt-domain-cl01"
+  },
+  "dvsSpecs": [
+    {
+      "dvsName": "mgmt-domain-cl01-vds01",
+      "networks": [
+        "MANAGEMENT",
+        "VM_MANAGEMENT",
+        "VMOTION",
+        "VSAN"
+      ],
+      "mtu": 8000,
+      "nsxtSwitchConfig": {
+        "transportZones": [
+          {
+            "name": "overlay-tz-mgmt-nsxt",
+            "transportType": "OVERLAY"
+          }
+        ]
+      },
+      "vmnicsToUplinks": [
+        {
+          "id": "vmnic0",
+          "uplink": "uplink1"
+        },
+        {
+          "id": "vmnic1",
+          "uplink": "uplink2"
+        }
+      ],
+      "nsxTeamings": [
+        {
+          "policy": "LOADBALANCE_SRCID",
+          "activeUplinks": [
+            "uplink1",
+            "uplink2"
+          ]
+        }
+      ]
+    }
+  ],
+  "nsxtSpec": {
+    "nsxtManagers": [
+      {
+        "hostname": "nsx21.{{zpod_domain}}"
+      }
+    ],
+    "nsxtManagerSize": "medium",
+    "vipFqdn": "nsx.{{zpod_domain}}",
+    "rootNsxtManagerPassword": "{{zpod_password}}",
+    "nsxtAdminPassword": "{{zpod_password}}",
+    "nsxtAuditPassword": "{{zpod_password}}",
+    "transportVlanId": 30,
+    "ipAddressPoolSpec": {
+      "name": "mgmt-domain-cl01-tep01",
+      "description": "mgmt-domain-cl01-tep01 descr",
+      "subnets": [
+        {
+          "ipAddressPoolRanges": [
+            {
+              "start": "172.16.30.11",
+              "end": "172.16.30.50"
+            }
+          ],
+          "cidr": "172.16.30.0/24",
+          "gateway": "172.16.30.1"
+        }
+      ]
+    },
+    "vpcSpec": {
+      "dtgwSpec": {
+        "vlan": 128,
+        "gatewayCidr": "{{zpod_subnet}}.129/26",
+        "externalIpBlockCidr": "{{zpod_subnet}}.128/26",
+        "privateTgwIpBlockCidr": "172.31.0.0/16"
+      }
+    },
+    "version": "9.1.0.0.25318225",
+    "useExistingDeployment": false
+  },
+  "networkSpecs": [
+    {
+      "networkType": "MANAGEMENT",
+      "subnet": "{{zpod_subnet}}.0/26",
+      "gateway": "{{zpod_subnet}}.1",
+      "vlanId": 0,
+      "mtu": 8000,
+      "teamingPolicy": "loadbalance_loadbased",
+      "activeUplinks": [
+        "uplink1",
+        "uplink2"
+      ],
+      "portGroupKey": "mgmt-domain-cl01-vds01-pg-esx-mgmt",
+      "ipAddressVersion": "IPv4",
+      "ipAddressAssignmentMode": "STATIC"
+    },
+    {
+      "networkType": "VM_MANAGEMENT",
+      "subnet": "{{zpod_subnet}}.0/26",
+      "gateway": "{{zpod_subnet}}.1",
+      "vlanId": 0,
+      "mtu": 1500,
+      "teamingPolicy": "loadbalance_loadbased",
+      "activeUplinks": [
+        "uplink1",
+        "uplink2"
+      ],
+      "portGroupKey": "mgmt-domain-cl01-vds01-pg-vm-mgmt",
+      "ipAddressVersion": "IPv4",
+      "ipAddressAssignmentMode": "STATIC"
+    },
+    {
+      "networkType": "VMOTION",
+      "subnet": "172.16.10.0/24",
+      "gateway": "172.16.10.1",
+      "includeIpAddressRanges": [
+        {
+          "startIpAddress": "172.16.10.11",
+          "endIpAddress": "172.16.10.30"
+        }
+      ],
+      "vlanId": 10,
+      "mtu": 8000,
+      "teamingPolicy": "loadbalance_loadbased",
+      "activeUplinks": [
+        "uplink1",
+        "uplink2"
+      ],
+      "portGroupKey": "mgmt-domain-cl01-vds01-pg-vmotion",
+      "ipAddressVersion": "IPv4",
+      "ipAddressAssignmentMode": "STATIC"
+    },
+    {
+      "networkType": "VSAN",
+      "subnet": "172.16.20.0/24",
+      "gateway": "172.16.20.1",
+      "includeIpAddressRanges": [
+        {
+          "startIpAddress": "172.16.20.11",
+          "endIpAddress": "172.16.20.50"
+        }
+      ],
+      "vlanId": 20,
+      "mtu": 8000,
+      "teamingPolicy": "loadbalance_loadbased",
+      "activeUplinks": [
+        "uplink1",
+        "uplink2"
+      ],
+      "portGroupKey": "mgmt-domain-cl01-vds01-pg-vsan",
+      "ipAddressVersion": "IPv4",
+      "ipAddressAssignmentMode": "STATIC"
+    }
+  ],
+  "dnsSpec": {
+    "subdomain": "{{zpod_domain}}",
+    "nameservers": [
+      "{{zpod_subnet}}.2"
+    ]
+  },
+  "ntpServers": [
+    "{{zpodfactory_ip}}"
+  ],
+  "sddcManagerSpec": {
+    "rootPassword": "{{zpod_password}}",
+    "hostname": "sddcmgr.{{zpod_domain}}",
+    "sshPassword": "{{zpod_password}}",
+    "localUserPassword": "{{zpod_password}}",
+    "version": "9.1.0.0.25371088",
+    "useExistingDeployment": false
+  },
+  "managementPoolName": "mgmt-domain-np01",
+  "datastoreSpec": {
+    "vsanSpec": {
+      "datastoreName": "mgmt-domain-cl01-ds-vsan01",
+      "vsanDedup": false,
+      "esaConfig": {
+        "enabled": true
+      },
+      "encryptionConfig": {
+        "dataInTransitConfig": {
+          "enable": false
+        }
+      },
+      "failuresToTolerate": 1
+    }
+  },
+  "vspClusterSpec": {
+    "platformFqdn": "vcfservicesruntime.{{zpod_domain}}",
+    "systemUserPassword": "{{zpod_password}}",
+    "ipv4Pool": {
+      "ipRange": {
+        "startIpAddress": "{{zpod_subnet}}.36",
+        "endIpAddress": "{{zpod_subnet}}.49"
+      }
+    },
+    "size": "small",
+    "internalClusterCidrIpv4": "198.18.0.0/15",
+    "instanceFqdn": "instancecomponents.{{zpod_domain}}",
+    "fleetFqdn": "fleetmgr.{{zpod_domain}}"
+  },
+  "fleetLcmSpec": {
+    "size": "small"
+  },
+  "sddcLcmSpec": {
+    "size": "small"
+  },
+  "fleetDepotSpec": {
+    "size": "small"
+  },
+  "telemetryAcceptorSpec": {
+    "size": "small"
+  },
+  "vidbSpec": {
+    "hostname": "identitybroker.{{zpod_domain}}",
+    "size": "small"
+  },
+  "saltSpec": {
+    "size": "small"
+  },
+  "saltRaasSpec": {
+    "size": "small"
+  },
+  "vcfOperationsSpec": {
+    "nodes": [
+      {
+        "hostname": "vcfops.{{zpod_domain}}",
+        "rootUserPassword": "{{zpod_password}}",
+        "type": "master"
+      }
+    ],
+    "adminUserPassword": "{{zpod_password}}",
+    "applianceSize": "small",
+    "useExistingDeployment": false
+  },
+  "vcfOperationsCollectorSpec": {
+    "hostname": "cloudproxy.{{zpod_domain}}",
+    "rootUserPassword": "{{zpod_password}}",
+    "applianceSize": "small",
+    "useExistingDeployment": false
+  },
+  "licenseServerSpec": {
+    "hostname": "vcflicense.{{zpod_domain}}"
+  }
+}

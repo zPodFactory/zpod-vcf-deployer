@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["httpx", "rich", "typer", "python-dotenv", "jinja2", "typing-extensions"]
+# dependencies = ["httpx", "rich", "typer", "python-dotenv", "jinja2", "typing-extensions", "asyncssh"]
 # ///
 
 import asyncio
@@ -36,6 +36,60 @@ app = typer.Typer(
 console = Console()
 global_debug = False
 monitoring_active = False
+
+
+class DebugConsole:
+    """Routes verbose debug output to the screen, a log file, or both.
+
+    ``--debug`` enables the screen target; ``--debug-log`` enables a
+    timestamped log file. Debug call sites use ``debug_console.print(...)``
+    so the main ``console`` (normal output) stays clean when only
+    ``--debug-log`` is active.
+    """
+
+    def __init__(self):
+        self._screen = None
+        self._file_console = None
+        self._file_handle = None
+        self.logfile_path = None
+
+    def enable_screen(self, screen_console):
+        self._screen = screen_console
+
+    def enable_logfile(self, path):
+        """Open a log file and attach a (color-free) Console writing to it."""
+        self._file_handle = open(path, "w", encoding="utf-8")
+        self.logfile_path = path
+        self._file_console = Console(
+            file=self._file_handle,
+            width=160,
+            force_terminal=False,
+            no_color=True,
+            highlight=False,
+            soft_wrap=False,
+        )
+
+    @property
+    def active(self):
+        return self._screen is not None or self._file_console is not None
+
+    def print(self, *args, **kwargs):
+        if self._screen is not None:
+            self._screen.print(*args, **kwargs)
+        if self._file_console is not None:
+            self._file_console.print(*args, **kwargs)
+
+    def close(self):
+        if self._file_handle is not None:
+            try:
+                self._file_handle.flush()
+                self._file_handle.close()
+            except Exception:
+                pass
+            self._file_handle = None
+
+
+debug_console = DebugConsole()
 
 
 def version_callback(value: bool):
@@ -205,7 +259,14 @@ def main(
         False,
         "--debug",
         "-d",
-        help="Enable debug output (API headers, payloads, responses)",
+        help="Enable debug output on screen (API headers, payloads, responses)",
+        is_eager=True,
+    ),
+    debug_log: bool = typer.Option(
+        False,
+        "--debug-log",
+        help="Write debug output to a timestamped log file in the current "
+        "directory (keeps the screen output clean)",
         is_eager=True,
     ),
     version: bool = typer.Option(
@@ -218,9 +279,27 @@ def main(
 ):
     """zPod VCF Deployer - Deploy zPod and configure VCF with depot management"""
     global global_debug
-    global_debug = debug
+    # global_debug gates every debug block; it is True when debug output is
+    # wanted on the screen (--debug) and/or in a log file (--debug-log).
+    global_debug = debug or debug_log
+
     if debug:
+        debug_console.enable_screen(console)
         console.print("[bold yellow]Debug mode enabled[/bold yellow]")
+
+    if debug_log:
+        logfile = (
+            Path.cwd()
+            / f"zpod-vcf-deployer-{zpod_name}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        )
+        debug_console.enable_logfile(logfile)
+        debug_console.print(
+            f"zPod VCF Deployer debug log — zPod '{zpod_name}' — "
+            f"started {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        console.print(
+            f"[bold yellow]Debug logging enabled → {logfile}[/bold yellow]"
+        )
 
     # Validate VCF SKU
     if vcf_sku.upper() not in ("VCF", "VVF"):
@@ -260,30 +339,40 @@ def main(
     start_time = time.perf_counter()
     console.print("[bold cyan]Starting zPod VCF deployment...[/bold cyan]")
 
-    asyncio.run(
-        _deploy_entry(
-            vcf_json_template=vcf_json_template,
-            zpod_name=zpod_name,
-            zpodfactory_profile=zpodfactory_profile,
-            zpodfactory_endpoint=zpodfactory_endpoint,
-            zpodfactory_access_token=zpodfactory_access_token,
-            zpodfactory_base_url=zpodfactory_base_url,
-            depot_mode=depot_mode,
-            online_depot_download_token=online_depot_download_token,
-            offline_depot_hostname=offline_depot_hostname,
-            offline_depot_username=offline_depot_username,
-            offline_depot_password=offline_depot_password,
-            offline_depot_port=offline_depot_port,
-            vcf_sku=vcf_sku,
-            vcf_version=vcf_version,
+    try:
+        asyncio.run(
+            _deploy_entry(
+                vcf_json_template=vcf_json_template,
+                zpod_name=zpod_name,
+                zpodfactory_profile=zpodfactory_profile,
+                zpodfactory_endpoint=zpodfactory_endpoint,
+                zpodfactory_access_token=zpodfactory_access_token,
+                zpodfactory_base_url=zpodfactory_base_url,
+                depot_mode=depot_mode,
+                online_depot_download_token=online_depot_download_token,
+                offline_depot_hostname=offline_depot_hostname,
+                offline_depot_username=offline_depot_username,
+                offline_depot_password=offline_depot_password,
+                offline_depot_port=offline_depot_port,
+                vcf_sku=vcf_sku,
+                vcf_version=vcf_version,
+            )
         )
-    )
-
-    end_time = time.perf_counter()
-    total_time = end_time - start_time
-
-    time_str = format_time(total_time)
-    console.print(f"[bold green]✅ Total deployment time: {time_str}[/bold green]")
+    finally:
+        end_time = time.perf_counter()
+        time_str = format_time(end_time - start_time)
+        console.print(
+            f"[bold green]✅ Total deployment time: {time_str}[/bold green]"
+        )
+        if debug_log:
+            debug_console.print(
+                f"Total deployment time: {time_str} — "
+                f"finished {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            console.print(
+                f"[dim]Debug log written to {debug_console.logfile_path}[/dim]"
+            )
+            debug_console.close()
 
 
 def format_time(total_time):
@@ -332,7 +421,7 @@ def timeit(func):
 
         # Additional debug info if debug mode is enabled
         if global_debug:
-            console.print(f"[dim]Function {func.__name__} took {time_str}[/dim]\n")
+            debug_console.print(f"[dim]Function {func.__name__} took {time_str}[/dim]\n")
 
         return result
 
@@ -483,7 +572,13 @@ class VCFClient:
         self.username = username
         self.password = password
         self.token = None
-        self.client = httpx.AsyncClient(verify=False)  # Skip SSL verification
+        # A generous read timeout: calls like POST /v1/sddcs take a while for
+        # the installer to acknowledge. The httpx default (5s) is far too low
+        # and caused premature ReadTimeouts.
+        self.client = httpx.AsyncClient(
+            verify=False,  # Skip SSL verification
+            timeout=httpx.Timeout(180.0, connect=30.0),
+        )
 
     async def _handle_connection_error(
         self,
@@ -519,8 +614,17 @@ class VCFClient:
         max_retries: int = 10,
         retry_delay: int = 10,
         handle_401: bool = False,
+        idempotent: bool = True,
     ) -> httpx.Response:
-        """Make HTTP request with retry logic and error handling"""
+        """Make HTTP request with retry logic and error handling.
+
+        ``idempotent`` must be False for requests that create a resource
+        (e.g. POST /v1/sddcs). A timeout/connection error on such a request
+        may mean the server already processed it, so retrying would create a
+        duplicate — those requests are attempted exactly once.
+        """
+        if not idempotent:
+            max_retries = 1
         for attempt in range(max_retries):
             try:
                 response = await self.client.request(
@@ -528,7 +632,7 @@ class VCFClient:
                 )
 
                 if global_debug:
-                    console.print(
+                    debug_console.print(
                         f"[dim]HTTP Status Code: {response.status_code}[/dim]"
                     )
 
@@ -543,11 +647,11 @@ class VCFClient:
                     and attempt < max_retries - 1
                 ):
                     if global_debug:
-                        console.print()
-                        console.print(
+                        debug_console.print()
+                        debug_console.print(
                             f"[yellow]⚠️ Authentication token expired (HTTP 401).[/yellow]"
                         )
-                        console.print(
+                        debug_console.print(
                             f"[yellow]Refreshing token and retrying... (Attempt {attempt + 1:2d}/{max_retries})[/yellow]"
                         )
                     try:
@@ -556,7 +660,7 @@ class VCFClient:
                         if headers:
                             headers["Authorization"] = f"Bearer {self.token}"
                         if global_debug:
-                            console.print(
+                            debug_console.print(
                                 "[bold green]✓ Authentication successful[/bold green]"
                             )
                         continue
@@ -589,7 +693,7 @@ class VCFClient:
                         error_msg += f": {e.response.text}"
 
                     if global_debug:
-                        console.print(
+                        debug_console.print(
                             f"[red]Error response ({e.response.status_code}): {error_msg}[/red]"
                         )
                     raise Exception(error_msg)
@@ -601,7 +705,7 @@ class VCFClient:
                 httpx.WriteTimeout,
             ) as e:
                 if global_debug:
-                    console.print(
+                    debug_console.print(
                         f"[red]Connection error: {type(e).__name__}: {str(e)}[/red]"
                     )
                 if await self._handle_connection_error(
@@ -613,7 +717,7 @@ class VCFClient:
 
             except Exception as e:
                 if global_debug:
-                    console.print(
+                    debug_console.print(
                         f"[red]Unexpected error: {type(e).__name__}: {str(e)}[/red]"
                     )
                 if await self._handle_connection_error(
@@ -629,8 +733,8 @@ class VCFClient:
         data = {"username": self.username, "password": self.password}
 
         if global_debug:
-            console.print(f"[dim]Making POST request to: {url}[/dim]")
-            console.print(f"[dim]Request data: {json.dumps(data, indent=2)}[/dim]")
+            debug_console.print(f"[dim]Making POST request to: {url}[/dim]")
+            debug_console.print(f"[dim]Request data: {json.dumps(data, indent=2)}[/dim]")
 
         response = await self._make_request("POST", url, data=data, retry_delay=30)
 
@@ -638,17 +742,17 @@ class VCFClient:
         self.token = token_data.get("accessToken")
 
         if global_debug:
-            console.print(
+            debug_console.print(
                 f"[dim]Token Response: {json.dumps(token_data, indent=2)}[/dim]"
             )
-            console.print("[bold green]✓ Authentication successful[/bold green]")
+            debug_console.print("[bold green]✓ Authentication successful[/bold green]")
 
         return self.token
 
     async def refresh_token(self) -> str:
         """Refresh the access token"""
         if global_debug:
-            console.print("[dim]🔄 Refreshing authentication token...[/dim]")
+            debug_console.print("[dim]🔄 Refreshing authentication token...[/dim]")
 
         # Clear the current token to force a new authentication
         self.token = None
@@ -659,8 +763,13 @@ class VCFClient:
         method: str,
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
+        idempotent: bool = True,
     ) -> Dict[str, Any]:
-        """Make API call with authentication and automatic token refresh"""
+        """Make API call with authentication and automatic token refresh.
+
+        Pass ``idempotent=False`` for resource-creating POSTs so a timeout is
+        not retried into a duplicate resource.
+        """
         if not self.token:
             await self.get_token()
 
@@ -671,18 +780,19 @@ class VCFClient:
         }
 
         if global_debug:
-            console.print(f"\n[dim]Making {method} request to: {url}[/dim]")
+            debug_console.print(f"\n[dim]Making {method} request to: {url}[/dim]")
             if data:
-                console.print(f"[dim]Request data: {json.dumps(data, indent=2)}[/dim]")
+                debug_console.print(f"[dim]Request data: {json.dumps(data, indent=2)}[/dim]")
 
         response = await self._make_request(
-            method, url, data=data, headers=headers, handle_401=True
+            method, url, data=data, headers=headers, handle_401=True,
+            idempotent=idempotent,
         )
 
         # Handle HTTP 204 (No Content) responses
         if response.status_code == 204:
             if global_debug:
-                console.print(
+                debug_console.print(
                     f"[dim]Response ({response.status_code}): "
                     "No Content (empty response body)[/dim]"
                 )
@@ -690,7 +800,7 @@ class VCFClient:
 
         result = response.json()
         if global_debug:
-            console.print(
+            debug_console.print(
                 f"[dim]Response ({response.status_code}): "
                 f"{json.dumps(result, indent=2)}[/dim]"
             )
@@ -743,6 +853,20 @@ async def _deploy_entry(
     # Parse VCF JSON template
     vcf_template_data = json.loads(vcf_json_template.read())
 
+    # Warn if the --vcf-version flag's major.minor differs from the template's
+    # version family — the template version drives deployment behavior, while
+    # --vcf-version drives the depot/release-component API calls.
+    template_version = str(vcf_template_data.get("version", ""))
+    if template_version:
+        tmpl_family = template_version.split(".")[:2]
+        flag_family = str(vcf_version).split(".")[:2]
+        if tmpl_family != flag_family:
+            console.print(
+                f"[yellow]⚠️ --vcf-version ({vcf_version}) does not match the "
+                f"template version ({template_version}). Pass --vcf-version "
+                f"{template_version} to align the depot/bundle API calls.[/yellow]"
+            )
+
     # Create zPod client
     zpod_client = httpx.Client(
         base_url=zpodfactory_base_url,
@@ -772,6 +896,11 @@ async def _deploy_entry(
             Path("/tmp") / f"{zpod_name}-{time.strftime('%Y%m%d-%H%M%S')}.json"
         )
         write_vcf_template(vcf_json, output_file)
+
+        # Install the nested vSAN ESA mock-HW VIB on the ESXi hosts (VCF 9.1
+        # enables vSAN ESA, which needs this on nested hardware). No-op for 9.0.
+        if is_vcf91(vcf_json):
+            await install_vsan_esa_mock_vib(vcf_json, zpod)
 
         # Configure DNS
         configure_dns(zpod_client, zpod_name, vcf_json)
@@ -904,7 +1033,7 @@ async def check_latest_validation(client: VCFClient) -> bool:
             return False
     except Exception as e:
         if global_debug:
-            console.print(
+            debug_console.print(
                 f"[yellow]⚠️ Error checking for existing validation: {e}[/yellow]"
             )
         return False
@@ -925,7 +1054,7 @@ async def get_latest_validation_id(client: VCFClient) -> Optional[str]:
         return latest_validation.get("id") if latest_validation else None
     except Exception as e:
         if global_debug:
-            console.print(f"[yellow]⚠️ Error getting validation ID: {e}[/yellow]")
+            debug_console.print(f"[yellow]⚠️ Error getting validation ID: {e}[/yellow]")
         return None
 
 
@@ -955,7 +1084,7 @@ async def check_latest_sddc(client: VCFClient) -> bool:
             return False
     except Exception as e:
         if global_debug:
-            console.print(
+            debug_console.print(
                 f"[yellow]⚠️ Error checking for existing SDDC deployment: {e}[/yellow]"
             )
         return False
@@ -976,7 +1105,7 @@ async def get_latest_sddc_id(client: VCFClient) -> Optional[str]:
         return latest_sddc.get("id") if latest_sddc else None
     except Exception as e:
         if global_debug:
-            console.print(f"[yellow]⚠️ Error getting SDDC ID: {e}[/yellow]")
+            debug_console.print(f"[yellow]⚠️ Error getting SDDC ID: {e}[/yellow]")
         return None
 
 
@@ -1027,7 +1156,7 @@ async def deploy_zpod(
         raise typer.Exit(code=1)
 
     if global_debug:
-        console.print(f"[dim]Creating zPod with endpoint: {endpoint}[/dim]")
+        debug_console.print(f"[dim]Creating zPod with endpoint: {endpoint}[/dim]")
 
     zpod = zpod_client.post(
         "/zpods",
@@ -1056,7 +1185,7 @@ async def deploy_zpod(
     elif status == "DEPLOY_FAILED":
         console.print("[bold red]❌ zPod Deployment Failed[/bold red]")
         if global_debug:
-            console.print(Pretty(zpod))
+            debug_console.print(Pretty(zpod))
         raise typer.Exit(code=1)
 
     console.print(f"[bold red]❌ Unexpected status: {status}[/bold red]")
@@ -1084,6 +1213,86 @@ def fetch_zpodfactory_host_ip(zpod_client: httpx.Client) -> str:
         raise typer.Exit(code=1)
     console.print(f"[green]✓ zPodFactory host IP: {ip}[/green]")
     return ip
+
+
+# ---------------------------------------------------------------------------
+# VCF version-family support (9.0.x and 9.1.x)
+#
+# Both mappings below are single, version-agnostic tables. They are driven by
+# the rendered template: a key only takes effect when it is actually present
+# in the template JSON, so VCF 9.0-only and 9.1-only entries coexist safely in
+# one dict. is_vcf91() remains for the few behaviors that genuinely differ
+# (ESXi vSAN ESA VIB install, depot-skip warning verbosity).
+# ---------------------------------------------------------------------------
+
+# hostname (short name) -> last octet of the zPod /26 subnet.
+# Layout note: .50-.60 is a DHCP range; the VCF 9.1 vspClusterSpec.ipv4Pool
+# occupies .36-.49 (a pool, not a host -> no DNS record; >=12 IPs required
+# by VCF Management Services).
+# 9.0 and 9.1 share octets. The cloud proxy was renamed between versions
+# (9.0: "vcfopscollector", 9.1: "cloudproxy") — both names map to the same
+# octet since they are the same role and a template only references one.
+# The fleet manager ("fleetmgr") and NSX manager node ("nsx21") each use a
+# single name in every template.
+HOSTNAME_IP_MAPPING = {
+    # core infrastructure (low octets)
+    "vcfops": "3",
+    "cloudproxy": "4",
+    "vcfopscollector": "4",  # 9.0 name for the cloud proxy — same role/IP
+    "sddcmgr": "5",
+    "fleetmgr": "6",
+    "vcflicense": "8",
+    "identitybroker": "9",
+    # shared across 9.0 and 9.1
+    "vcsa": "10",
+    "nsx": "20",
+    "nsx21": "21",
+    # VCF 9.1 VCF Services Platform (VSP) FQDNs
+    "vcfservicesruntime": "30",
+    "instancecomponents": "31",
+    # VCF 9.0-only component
+    "vcfa": "30",
+}
+
+# VCF JSON spec key -> depot/release component name(s). A spec key only
+# contributes its components when that key is present in the rendered template.
+# This single table serves both versions: 9.1 split VCF Operations and its
+# Cloud Proxy across vcfOperationsSpec / vcfOperationsCollectorSpec, but since
+# both spec keys are present in 9.0 and 9.1 templates alike, the resulting
+# component set ({VROPS, VCF_OPS_CLOUD_PROXY}) is identical either way.
+# NOTE: the 9.1 component name strings are preliminary and must be reconciled
+# against a live release-components API response before a real run.
+SPEC_TO_COMPONENTS = {
+    "hostSpecs": ["HOST", "ESXI"],
+    "vcenterSpec": ["VCENTER"],
+    "sddcManagerSpec": ["SDDC_MANAGER"],
+    "nsxtSpec": ["NSX_T_MANAGER"],
+    "vcfOperationsSpec": ["VROPS"],
+    "vcfOperationsLogsSpec": ["VRLI"],  # FIXME: verify component string
+    "vcfOperationsFleetManagementSpec": ["VRSLCM"],
+    "vcfOperationsCollectorSpec": ["VCF_OPS_CLOUD_PROXY"],
+    "vspClusterSpec": ["VSP"],
+    "vcfAutomationSpec": ["VRA", "VCF_SERVICE_VCD_MIGRATION_BACKEND"],
+    "licenseServerSpec": ["VCF_LICENSE_SERVER"],
+    "vidbSpec": ["VIDB"],
+    "saltSpec": ["VCF_SALT"],
+    "saltRaasSpec": ["VCF_SALT_RAAS"],
+    "telemetryAcceptorSpec": ["TELEMETRY_ACCEPTOR"],
+    "fleetLcmSpec": ["VCF_FLEET_LCM"],
+    "sddcLcmSpec": ["VCF_SDDC_LCM"],
+    "fleetDepotSpec": ["DEPOT_SERVICE"],
+}
+
+
+def is_vcf91(vcf_json: dict) -> bool:
+    """Return True for VCF 9.1.x (and later), derived from the rendered
+    template's top-level ``version`` field. Defaults to False (9.0 behavior)
+    when the version cannot be parsed."""
+    parts = str(vcf_json.get("version", "")).split(".")
+    try:
+        return (int(parts[0]), int(parts[1])) >= (9, 1)
+    except (IndexError, ValueError):
+        return False
 
 
 def build_vcf_template(zpod, tmpl, zpodfactory_ip: str):
@@ -1126,12 +1335,12 @@ def build_vcf_template(zpod, tmpl, zpodfactory_ip: str):
     }
 
     if global_debug:
-        console.print(f"[dim]Template variables:[/dim]")
-        console.print(f"[dim]  zpod_domain: {template_vars['zpod_domain']}[/dim]")
-        console.print(f"[dim]  zpod_name: {template_vars['zpod_name']}[/dim]")
-        console.print(f"[dim]  zpod_subnet: {template_vars['zpod_subnet']}[/dim]")
-        console.print(f"[dim]  zpodfactory_ip: {template_vars['zpodfactory_ip']}[/dim]")
-        console.print(
+        debug_console.print(f"[dim]Template variables:[/dim]")
+        debug_console.print(f"[dim]  zpod_domain: {template_vars['zpod_domain']}[/dim]")
+        debug_console.print(f"[dim]  zpod_name: {template_vars['zpod_name']}[/dim]")
+        debug_console.print(f"[dim]  zpod_subnet: {template_vars['zpod_subnet']}[/dim]")
+        debug_console.print(f"[dim]  zpodfactory_ip: {template_vars['zpodfactory_ip']}[/dim]")
+        debug_console.print(
             f"[dim]  zpod_password: {'*' * len(template_vars['zpod_password']) if template_vars['zpod_password'] else 'None'}[/dim]"
         )
 
@@ -1167,6 +1376,124 @@ def write_vcf_template(vcf_json, filename):
         json.dump(vcf_json, f, indent=2)
 
 
+# nested vSAN ESA mock-HW VIB (https://github.com/lamw/nested-vsan-esa-mock-hw-vib).
+# VCF 9.1 turns on vSAN ESA; nested ESXi lacks certified hardware, so this VIB
+# fakes the capability flags. Pre-built artifact from the repo's "1.0" release.
+VSAN_ESA_MOCK_VIB_URL = (
+    "https://github.com/lamw/nested-vsan-esa-mock-hw-vib/"
+    "releases/download/1.0/nested-vsan-esa-mock-hw.vib"
+)
+VSAN_ESA_MOCK_VIB_NAME = "nested-vsan-esa-mock-hw"
+
+
+async def _install_vib_on_host(hostname: str, username: str, password: str) -> str:
+    """Install the nested vSAN ESA mock-HW VIB on a single ESXi host over SSH.
+
+    Returns 'installed' or 'already-installed'. Raises RuntimeError on failure.
+    """
+    import asyncssh  # lazy import: only the VCF 9.1 ESA path needs it
+
+    try:
+        async with asyncssh.connect(
+            hostname,
+            username=username,
+            password=password,
+            known_hosts=None,  # nested ESXi host keys are ephemeral
+            login_timeout=30,
+        ) as conn:
+            # Idempotency: skip hosts that already have the VIB installed
+            check = await conn.run(
+                f"esxcli software vib list | grep -i {VSAN_ESA_MOCK_VIB_NAME}",
+                check=False,
+                timeout=60,
+            )
+            if check.exit_status == 0:
+                return "already-installed"
+
+            # httpClient ruleset is disabled by default and blocks the
+            # outbound fetch of the VIB URL — open it before installing.
+            commands = [
+                "esxcli network firewall ruleset set -e true -r httpClient",
+                "esxcli software acceptance set --level CommunitySupported",
+                f"esxcli software vib install -v {VSAN_ESA_MOCK_VIB_URL} "
+                f"--no-sig-check",
+                "/etc/init.d/vsanmgmtd restart",
+            ]
+            for cmd in commands:
+                if global_debug:
+                    debug_console.print(f"[dim]{hostname}: {cmd}[/dim]")
+                result = await conn.run(cmd, check=False, timeout=180)
+                if global_debug and result.stdout:
+                    debug_console.print(
+                        f"[dim]{hostname} stdout: {result.stdout.strip()}[/dim]"
+                    )
+                if result.exit_status != 0:
+                    raise RuntimeError(
+                        f"command failed (exit {result.exit_status}): {cmd}\n"
+                        f"{(result.stderr or '').strip()}"
+                    )
+            return "installed"
+    except asyncssh.Error as e:
+        raise RuntimeError(f"SSH error on {hostname}: {e}") from e
+    except OSError as e:
+        raise RuntimeError(f"connection to {hostname} failed: {e}") from e
+
+
+async def install_vsan_esa_mock_vib(vcf_json: dict, zpod: dict):
+    """Install the nested vSAN ESA mock-HW VIB on every ESXi host when the
+    template enables vSAN ESA. No-op when esaConfig is disabled."""
+    esa_enabled = (
+        vcf_json.get("datastoreSpec", {})
+        .get("vsanSpec", {})
+        .get("esaConfig", {})
+        .get("enabled", False)
+    )
+    if not esa_enabled:
+        console.print(
+            "[dim]vSAN ESA not enabled in template — "
+            "skipping mock-HW VIB install[/dim]"
+        )
+        return
+
+    hostnames = [
+        h["hostname"]
+        for h in vcf_json.get("hostSpecs", [])
+        if h.get("hostname")
+    ]
+    if not hostnames:
+        console.print("[yellow]⚠️ No ESXi hosts found in template[/yellow]")
+        return
+
+    console.print(
+        f"[bold cyan]🔧 Installing nested vSAN ESA mock-HW VIB on "
+        f"{len(hostnames)} ESXi host(s)...[/bold cyan]"
+    )
+
+    password = zpod.get("password", "")
+    results = await asyncio.gather(
+        *(_install_vib_on_host(h, "root", password) for h in hostnames),
+        return_exceptions=True,
+    )
+
+    failures = []
+    for hostname, result in zip(hostnames, results):
+        if isinstance(result, Exception):
+            console.print(f"  [red]✗[/red] {hostname}: {result}")
+            failures.append(hostname)
+        elif result == "already-installed":
+            console.print(
+                f"  [green]✓[/green] {hostname}: VIB already installed"
+            )
+        else:
+            console.print(f"  [green]✓[/green] {hostname}: VIB installed")
+
+    if failures:
+        console.print(
+            f"[bold red]❌ vSAN ESA mock-HW VIB install failed on: "
+            f"{', '.join(failures)}[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
 
 def configure_dns(
     zpod_client: httpx.Client,
@@ -1176,17 +1503,8 @@ def configure_dns(
     """Configure DNS records for the zPod"""
     console.print("[bold cyan]🌐 Configuring DNS records...[/bold cyan]")
 
-    # Correspondence table for hostname to IP mapping
-    hostname_ip_mapping = {
-        "vcsa": "10",
-        "nsx": "20",
-        "nsx21": "21",
-        "sddcmgr": "26",
-        "vcfopsfleetmgr": "27",
-        "vcfops": "28",
-        "vcfopscollector": "29",
-        "vcfa": "30",
-    }
+    # Correspondence table for hostname to IP mapping (shared 9.0/9.1 table)
+    hostname_ip_mapping = HOSTNAME_IP_MAPPING
 
     def find_hostnames_in_json(obj, hostnames=None):
         """Recursively find all hostnames in JSON structure that contain the domain"""
@@ -1195,9 +1513,14 @@ def configure_dns(
 
         if isinstance(obj, dict):
             for key, value in obj.items():
-                if key in ["hostname", "vcenterHostname", "vipFqdn"] and isinstance(
-                    value, str
-                ):
+                if key in [
+                    "hostname",
+                    "vcenterHostname",
+                    "vipFqdn",
+                    "platformFqdn",
+                    "instanceFqdn",
+                    "fleetFqdn",
+                ] and isinstance(value, str):
                     if "." in value and not value.startswith("{{"):
                         hostnames.append(value)
                 else:
@@ -1213,13 +1536,19 @@ def configure_dns(
         hostname_part = hostname.split(".")[0]
 
         if hostname_part in hostname_ip_mapping:
-            if hostname_part == "vcfinstaller" or hostname_part.startswith("esxi"):
-                return None, hostname
-
             ip_suffix = hostname_ip_mapping[hostname_part]
             ip_address = f"{zpod_subnet}.{ip_suffix}"
             return ip_address, hostname_part
 
+        # ESXi hosts and the VCF Installer intentionally get no DNS record here;
+        # any other unmapped hostname is likely a template/mapping mismatch.
+        if global_debug and not (
+            hostname_part.startswith("esxi") or hostname_part == "vcfinstaller"
+        ):
+            debug_console.print(
+                f"[yellow]⚠️ No IP mapping for hostname '{hostname_part}' "
+                f"({hostname}) — skipping DNS record[/yellow]"
+            )
         return None, hostname
 
     # Get the zpod subnet from the VCF JSON
@@ -1290,7 +1619,7 @@ def _ensure_dns_record(zpod_client, zpod_name, ip, hostname):
     if response.status_code == 404:
         dns_data = {"ip": ip, "hostname": hostname}
         if global_debug:
-            console.print(f"  [dim]DNS data: {dns_data}[/dim]")
+            debug_console.print(f"  [dim]DNS data: {dns_data}[/dim]")
 
         post_response = zpod_client.post(
             f"/zpods/name={zpod_name}/dns",
@@ -1300,19 +1629,19 @@ def _ensure_dns_record(zpod_client, zpod_name, ip, hostname):
             return "created"
 
         if global_debug:
-            console.print(f"  [dim]Status: {post_response.status_code}[/dim]")
+            debug_console.print(f"  [dim]Status: {post_response.status_code}[/dim]")
             try:
-                console.print(f"  [dim]Error: {post_response.json()}[/dim]")
+                debug_console.print(f"  [dim]Error: {post_response.json()}[/dim]")
             except json.JSONDecodeError:
-                console.print(f"  [dim]Error: {post_response.text}[/dim]")
+                debug_console.print(f"  [dim]Error: {post_response.text}[/dim]")
         return "failed"
 
     if global_debug:
-        console.print(f"  [dim]Unexpected status: {response.status_code}[/dim]")
+        debug_console.print(f"  [dim]Unexpected status: {response.status_code}[/dim]")
         try:
-            console.print(f"  [dim]Error: {response.json()}[/dim]")
+            debug_console.print(f"  [dim]Error: {response.json()}[/dim]")
         except json.JSONDecodeError:
-            console.print(f"  [dim]Error: {response.text}[/dim]")
+            debug_console.print(f"  [dim]Error: {response.text}[/dim]")
     return "failed"
 
 
@@ -1413,8 +1742,8 @@ async def configure_online_depot(client: VCFClient, download_token: str):
             f"[bold red]❌ Failed to configure depot settings: {e}[/bold red]"
         )
         if global_debug:
-            console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
-            console.print(
+            debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+            debug_console.print(
                 f"[red]Request data: {json.dumps(depot_data, indent=2)}[/red]"
             )
         raise
@@ -1473,8 +1802,8 @@ async def configure_offline_depot(
             f"[bold red]❌ Failed to configure depot settings: {e}[/bold red]"
         )
         if global_debug:
-            console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
-            console.print(
+            debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+            debug_console.print(
                 f"[red]Request data: {json.dumps(depot_data, indent=2)}[/red]"
             )
         raise
@@ -1505,7 +1834,7 @@ async def handle_depot_sync(client: VCFClient):
     except Exception as e:
         console.print(f"[bold red]❌ Failed to check depot sync info: {e}[/bold red]")
         if global_debug:
-            console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+            debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
         raise
 
 
@@ -1517,7 +1846,7 @@ async def trigger_depot_sync(client: VCFClient):
     except Exception as e:
         console.print(f"[yellow]⚠️ Could not trigger depot sync: {e}[/yellow]")
         if global_debug:
-            console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+            debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
         console.print("[cyan]Continuing to monitor sync status...[/cyan]")
 
 
@@ -1546,7 +1875,7 @@ async def wait_for_depot_sync(client: VCFClient):
                     "[yellow]Please check your depot configuration and try again.[/yellow]"
                 )
                 if global_debug:
-                    console.print(
+                    debug_console.print(
                         f"[red]Sync info: {json.dumps(sync_info, indent=2)}[/red]"
                     )
                 return
@@ -1558,7 +1887,7 @@ async def wait_for_depot_sync(client: VCFClient):
         except Exception as e:
             console.print(f"[red]Error checking depot sync status: {e}[/red]")
             if global_debug:
-                console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+                debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
             await asyncio.sleep(10)
 
 
@@ -1575,20 +1904,9 @@ def get_required_components(vcf_json: dict) -> set:
     Returns:
         Set of required component names matching the VCF release API
     """
-    # Single mapping from VCF JSON spec keys to API component names.
-    # A spec key can map to multiple components.
-    spec_to_components = {
-        "hostSpecs": ["ESXI"],
-        "vcenterSpec": ["VCENTER"],
-        "sddcManagerSpec": ["SDDC_MANAGER"],
-        "nsxtSpec": ["NSX_T_MANAGER"],
-        "vcfOperationsSpec": ["VROPS", "VCF_OPS_CLOUD_PROXY"],
-        "vcfOperationsFleetManagementSpec": ["VRSLCM"],
-        "vcfOperationsCollectorSpec": ["VROPS"],
-        # FIXME: VRA and VRLI spec key names are unknown, update once confirmed
-        "UNKNOWN_VRA_SPEC": ["VRA"],
-        "UNKNOWN_VRLI_SPEC": ["VRLI"],
-    }
+    # Mapping from VCF JSON spec keys to API component names (shared 9.0/9.1
+    # table). A spec key can map to multiple components.
+    spec_to_components = SPEC_TO_COMPONENTS
 
     required = set()
     for spec_key, component_names in spec_to_components.items():
@@ -1632,9 +1950,26 @@ async def handle_bundle_operations(
                 if name in required_components
             }
             if skipped:
+                # On 9.1 the spec->component name strings are still being
+                # confirmed, so surface skips visibly rather than dimmed —
+                # a mapping miss here silently drops a needed bundle.
+                skip_style = "yellow" if is_vcf91(vcf_json) else "dim"
                 console.print(
-                    f"[dim]Skipping bundles not needed by config template: "
-                    f"{', '.join(sorted(skipped))}[/dim]"
+                    f"[{skip_style}]Skipping bundles not needed by config "
+                    f"template: {', '.join(sorted(skipped))}[/{skip_style}]"
+                )
+            # Components the mapping asked for but the depot API did not
+            # return (likely a wrong component-name string in
+            # SPEC_TO_COMPONENTS). Only flagged on 9.1: the 9.1 component
+            # names are still being verified, whereas the 9.0 set is
+            # established (and deliberately carries the harmless extra
+            # "HOST" name from the shared table).
+            missing = required_components - all_component_names
+            if missing and is_vcf91(vcf_json):
+                console.print(
+                    f"[bold yellow]⚠️ Required components not found in the "
+                    f"release components list: {', '.join(sorted(missing))} — "
+                    f"verify the spec-to-component mapping[/bold yellow]"
                 )
 
         # Get current download status
@@ -1674,7 +2009,7 @@ async def handle_bundle_operations(
             f"[bold red]❌ Failed to handle bundle operations: {e}[/bold red]"
         )
         if global_debug:
-            console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
+            debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
         raise
 
 
@@ -2072,13 +2407,15 @@ async def initiate_sddc_validations(
 
         # Create new validation
         if global_debug:
-            console.print(f"[dim]Sending validation request with JSON payload:[/dim]")
-            console.print("-" * 80)
-            console.print(json.dumps(vcf_json, indent=2))
-            console.print("-" * 80)
+            debug_console.print(f"[dim]Sending validation request with JSON payload:[/dim]")
+            debug_console.print("-" * 80)
+            debug_console.print(json.dumps(vcf_json, indent=2))
+            debug_console.print("-" * 80)
 
         try:
-            response = await client.api_call("POST", "/v1/sddcs/validations", vcf_json)
+            response = await client.api_call(
+                "POST", "/v1/sddcs/validations", vcf_json, idempotent=False
+            )
             sddc_val_id = response["id"]
         except Exception as e:
             if "403" in str(e):
@@ -2145,7 +2482,7 @@ async def initiate_sddc_validations(
     elif executionStatus == "FAILED":
         console.print("\n[bold red]❌ SDDC validation failed[/bold red]")
         if global_debug:
-            console.print(Pretty(sddc_val))
+            debug_console.print(Pretty(sddc_val))
         raise typer.Exit(code=1)
 
     console.print(
@@ -2176,10 +2513,48 @@ async def initiate_sddc_deployment(
     # Create new deployment if no sddc_id provided
     if not sddc_id:
         console.print("[bold cyan]🚀 Initiating SDDC deployment...[/bold cyan]")
-        console.print("[cyan]Creating new SDDC deployment...[/cyan]")
-        sddc = await client.api_call("POST", "/v1/sddcs", vcf_json)
-        sddc_id = sddc["id"]
-        console.print(f"[cyan]✓ New SDDC deployment created with ID: {sddc_id}[/cyan]")
+
+        # Guard against creating a duplicate: if a deployment already exists
+        # (e.g. a previous run created one), attach to it instead of POSTing.
+        existing_id = await get_latest_sddc_id(client)
+        if existing_id:
+            console.print(
+                f"[yellow]⚠️ An SDDC deployment already exists ({existing_id}) "
+                f"— attaching to it instead of creating a new one.[/yellow]"
+            )
+            sddc_id = existing_id
+        else:
+            console.print("[cyan]Creating new SDDC deployment...[/cyan]")
+            try:
+                # POST /v1/sddcs is NOT idempotent — attempt it exactly once.
+                sddc = await client.api_call(
+                    "POST", "/v1/sddcs", vcf_json, idempotent=False
+                )
+                sddc_id = sddc["id"]
+                console.print(
+                    f"[cyan]✓ New SDDC deployment created with ID: {sddc_id}[/cyan]"
+                )
+            except Exception as e:
+                # A timeout/error here may still mean the deployment was
+                # created server-side. Recover by querying the latest
+                # deployment rather than retrying the POST (which would
+                # create a duplicate).
+                console.print(
+                    f"[yellow]⚠️ SDDC create request did not return cleanly "
+                    f"({type(e).__name__}). Checking whether it was created "
+                    f"anyway...[/yellow]"
+                )
+                sddc_id = await get_latest_sddc_id(client)
+                if sddc_id:
+                    console.print(
+                        f"[cyan]✓ Deployment was created ({sddc_id}) — "
+                        f"attaching to it.[/cyan]"
+                    )
+                else:
+                    console.print(
+                        "[bold red]❌ SDDC deployment was not created.[/bold red]"
+                    )
+                    raise typer.Exit(code=1)
     else:
         console.print(
             f"[cyan]Monitoring existing SDDC deployment with ID: {sddc_id}[/cyan]"
@@ -2246,7 +2621,7 @@ async def initiate_sddc_deployment(
     elif sddc_status == "FAILED":
         console.print("\n[bold red]❌ SDDC deployment failed[/bold red]")
         if global_debug:
-            console.print(Pretty(sddc))
+            debug_console.print(Pretty(sddc))
         raise typer.Exit(code=1)
 
     console.print(f"\n[bold red]❌ Unexpected status: {sddc_status}[/bold red]")
@@ -2340,17 +2715,35 @@ def generate_validation_status_display(validation_data: dict = None) -> Text:
         checks_text.append(" ")
         checks_text.append(check_icon)
 
-        # Add error information if available and status is not SUCCEEDED
+        # Add error information if available and status is not SUCCEEDED.
+        # Render the nested errors as an indented tree, one per line, with the
+        # severity, the (suffix-stripped) error code, and the message.
         if check_status != "SUCCEEDED" and check.get("errorResponse"):
             error_response = check["errorResponse"]
             nested_errors = error_response.get("nestedErrors", [])
             if nested_errors:
-                checks_text.append(f" (", style="dim")
                 checks_text.append(
-                    f"{len(nested_errors)} error(s) {nested_errors}",
-                    style="red",
+                    f" ({len(nested_errors)} error(s))", style="dim"
                 )
-                checks_text.append(f")", style="dim")
+                for err in nested_errors:
+                    code = err.get("errorCode", "UNKNOWN")
+                    # errorCode is suffixed with ".warning" / ".error" —
+                    # split that off to get the severity and the bare code.
+                    if "." in code:
+                        base_code, _, suffix = code.rpartition(".")
+                        severity = suffix.upper() if suffix else check_status
+                    else:
+                        base_code, severity = code, check_status
+                    sev_color = (
+                        "red" if severity in ("ERROR", "FAILED") else "yellow"
+                    )
+                    message = err.get("message", "")
+                    checks_text.append("\n")
+                    checks_text.append("   - ", style="dim")
+                    checks_text.append(severity, style=f"bold {sev_color}")
+                    checks_text.append(" - ", style="dim")
+                    checks_text.append(base_code, style=sev_color)
+                    checks_text.append(f": '{message}'", style="white")
 
         if i < len(validation_checks) - 1:
             checks_text.append("\n")
@@ -2438,7 +2831,9 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
         if milestone.get("status") == "IN_PROGRESS":
             # Get all subtasks (including INITIALIZED)
             all_subtasks = list(sddc_subtasks)
-            milestone_subtasks = get_sorted_milestone_subtasks(all_subtasks, n=10)
+            milestone_subtasks = get_sorted_milestone_subtasks(
+                all_subtasks, milestone=milestone, n=10
+            )
 
             for subtask in milestone_subtasks:
                 subtask_name = subtask.get("name", "Unknown Subtask")
@@ -2485,11 +2880,23 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
             milestones_text.append(" ", style="white")
             milestones_text.append(f"[{formatted_time}]", style="dim")
 
-            # If milestone is in progress, show its subtasks
+        # Add a task-count badge when available (VCF 9.1 milestones carry
+        # completedTasks/totalTasks; absent on 9.0 so the badge is omitted)
+        total_tasks = milestone.get("totalTasks")
+        if total_tasks is not None:
+            completed_tasks = milestone.get("completedTasks", 0)
+            milestones_text.append(" ", style="white")
+            milestones_text.append(
+                f"({completed_tasks}/{total_tasks})", style="dim cyan"
+            )
+
+        # If milestone is in progress, show its subtasks
         if milestone_status == "IN_PROGRESS":
             # Get all subtasks (including INITIALIZED)
             all_subtasks = list(sddc_subtasks)
-            milestone_subtasks = get_sorted_milestone_subtasks(all_subtasks, n=10)
+            milestone_subtasks = get_sorted_milestone_subtasks(
+                all_subtasks, milestone=milestone, n=10
+            )
 
             for subtask in milestone_subtasks:
                 subtask_name = subtask.get("name", "Unknown Subtask")
@@ -2539,42 +2946,58 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
     return full_text
 
 
-def get_sorted_milestone_subtasks(all_subtasks, n=10):
+def _window_subtasks(tasks, n=10):
     # Show a window of n subtasks around the current activity point.
     # The subtask list is sequential — tasks progress from INITIALIZED →
     # IN_PROGRESS → completed. We find the activity point and show a
     # window centered around it to stay within the current milestone scope.
 
-    if not all_subtasks:
+    if not tasks:
         return []
 
     # Find the IN_PROGRESS task index as our anchor point
     anchor_idx = None
-    for i, s in enumerate(all_subtasks):
+    for i, s in enumerate(tasks):
         if s.get("status", "") == "IN_PROGRESS":
             anchor_idx = i
             break
 
     # If no IN_PROGRESS task, find the first INITIALIZED task (next up)
     if anchor_idx is None:
-        for i, s in enumerate(all_subtasks):
+        for i, s in enumerate(tasks):
             if s.get("status", "") == "INITIALIZED":
                 anchor_idx = i
                 break
 
     # If still no anchor (all completed), show the last n
     if anchor_idx is None:
-        return all_subtasks[-n:]
+        return tasks[-n:]
 
     # Show a window: a few completed tasks before the anchor, then forward
     context_before = 3
     start = max(0, anchor_idx - context_before)
-    end = min(len(all_subtasks), start + n)
+    end = min(len(tasks), start + n)
     # Adjust start if we're near the end of the list
     if end - start < n:
         start = max(0, end - n)
 
-    return all_subtasks[start:end]
+    return tasks[start:end]
+
+
+def get_sorted_milestone_subtasks(all_subtasks, milestone=None, n=10):
+    # VCF 9.1 tags each subtask with a "milestoneTask" field equal to its
+    # parent milestone's name — when present, scope the window to just that
+    # milestone's subtasks. VCF 9.0 payloads have no such field, so fall back
+    # to a flat window over the whole subtask list (unchanged 9.0 behavior).
+    if milestone is not None:
+        milestone_name = milestone.get("name")
+        grouped = [
+            s for s in all_subtasks if s.get("milestoneTask") == milestone_name
+        ]
+        if grouped:
+            return _window_subtasks(grouped, n)
+
+    return _window_subtasks(all_subtasks, n)
 
 
 if __name__ == "__main__":

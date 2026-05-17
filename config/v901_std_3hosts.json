@@ -82,7 +82,7 @@
         "loadBalancerFqdn": null
     },
     "vcfOperationsFleetManagementSpec": {
-        "hostname": "vcfopsfleetmgr.{{zpod_domain}}",
+        "hostname": "fleetmgr.{{zpod_domain}}",
         "rootUserPassword": "{{zpod_password}}",
         "adminUserPassword": "{{zpod_password}}",
         "useExistingDeployment": false
