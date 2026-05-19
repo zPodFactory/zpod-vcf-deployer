@@ -1405,7 +1405,6 @@ HOSTNAME_IP_MAPPING = {
 # NOTE: the 9.1 component name strings are preliminary and must be reconciled
 # against a live release-components API response before a real run.
 SPEC_TO_COMPONENTS = {
-    "hostSpecs": ["HOST", "ESXI"],
     "vcenterSpec": ["VCENTER"],
     "sddcManagerSpec": ["SDDC_MANAGER"],
     "nsxtSpec": ["NSX_T_MANAGER"],
@@ -2086,27 +2085,11 @@ async def handle_bundle_operations(
         if vcf_json:
             required_components = get_required_components(vcf_json)
             all_component_names = set(vcf_components.keys())
-            skipped = all_component_names - required_components
             vcf_components = {
                 name: data
                 for name, data in vcf_components.items()
                 if name in required_components
             }
-            if skipped:
-                # On 9.1 the spec->component name strings are still being
-                # confirmed, so surface skips visibly rather than dimmed —
-                # a mapping miss here silently drops a needed bundle.
-                skip_style = "yellow" if is_vcf91(vcf_json) else "dim"
-                console.print(
-                    f"[{skip_style}]Skipping bundles not needed by config "
-                    f"template: {', '.join(sorted(skipped))}[/{skip_style}]"
-                )
-            # Components the mapping asked for but the depot API did not
-            # return (likely a wrong component-name string in
-            # SPEC_TO_COMPONENTS). Only flagged on 9.1: the 9.1 component
-            # names are still being verified, whereas the 9.0 set is
-            # established (and deliberately carries the harmless extra
-            # "HOST" name from the shared table).
             missing = required_components - all_component_names
             if missing and is_vcf91(vcf_json):
                 console.print(
