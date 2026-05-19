@@ -37,6 +37,11 @@ app = typer.Typer(
 console = Console()
 global_debug = False
 monitoring_active = False
+# Real VCF deployment time (seconds), derived from the SDDC milestones once a
+# deployment reaches a terminal state. Used for the final summary instead of
+# the script wall-clock, which under-counts when the script is relaunched to
+# monitor an already-running deployment. None until a deployment finishes.
+final_deployment_seconds = None
 
 
 class _TimestampedLogFile:
@@ -390,7 +395,14 @@ def main(
         )
     finally:
         end_time = time.perf_counter()
-        time_str = format_time(end_time - start_time)
+        # Prefer the real VCF deployment time derived from the SDDC milestones.
+        # The script wall-clock under-counts when the script is relaunched to
+        # monitor an already-running deployment, so it is only a fallback
+        # (e.g. when no deployment reached a terminal state this run).
+        if final_deployment_seconds is not None:
+            time_str = format_time(final_deployment_seconds)
+        else:
+            time_str = format_time(end_time - start_time)
         console.print(
             f"[bold green]✅ Total deployment time: {time_str}[/bold green]"
         )
@@ -440,6 +452,15 @@ def timeit(func):
         result = await func(*args, **kwargs)
         end_time = time.perf_counter()
         total_time = end_time - start_time
+
+        # For the SDDC deployment step, prefer the real milestone-derived
+        # deployment time over the script wall-clock — the latter under-counts
+        # when the script is relaunched to monitor an already-running deploy.
+        if (
+            func.__name__ == "initiate_sddc_deployment"
+            and final_deployment_seconds is not None
+        ):
+            total_time = final_deployment_seconds
 
         # Format time to be more human-friendly
         time_str = format_time(total_time)
@@ -2640,7 +2661,7 @@ async def initiate_sddc_deployment(
     Raises:
         typer.Exit: On deployment failures or errors
     """
-    global monitoring_active
+    global monitoring_active, final_deployment_seconds
 
     # Create new deployment if no sddc_id provided
     if not sddc_id:
@@ -2737,8 +2758,13 @@ async def initiate_sddc_deployment(
 
                         sddc_status = sddc["status"]
                         if sddc_status != "IN_PROGRESS":
-                            # Terminal state — dump the full payload once for
+                            # Terminal state — record the real (milestone-
+                            # derived) deployment time for the final summary,
+                            # and dump the full payload once for
                             # troubleshooting (per-poll dumps are suppressed).
+                            final_deployment_seconds = (
+                                sddc_milestones_elapsed_seconds(sddc)
+                            )
                             if global_debug:
                                 debug_console.print(
                                     f"[dim]Final SDDC deployment response "
@@ -3026,6 +3052,29 @@ def format_seconds(total_seconds: int) -> str:
     return _plural(seconds, "second")
 
 
+def sddc_milestones_elapsed_seconds(sddc: dict) -> Optional[int]:
+    """Total deployment time derived from an SDDC object's milestones.
+
+    Milestones run back-to-back, so this sums each milestone's wall-clock
+    duration — the real VCF deployment elapsed time, independent of when this
+    script started monitoring. That distinction matters for resumed
+    deployments, where a script wall-clock timer would under-count.
+
+    Returns None when the milestones carry no usable timestamps.
+    """
+    total = 0
+    found = False
+    for milestone in sddc.get("milestones") or []:
+        secs = elapsed_seconds(
+            milestone.get("creationTimestamp"),
+            milestone.get("updateTimestamp"),
+        )
+        if secs is not None:
+            total += secs
+            found = True
+    return total if found else None
+
+
 # Rich's built-in "dots" spinner drives the in-progress milestone indicator.
 # rich.spinner.Spinner is a block renderable, so it can't be embedded inline
 # in a Text — instead we let it own the frame set and timing and just pull
@@ -3074,11 +3123,9 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
     milestones = deployment_data.get("milestones", [])
     sddc_subtasks = deployment_data.get("sddcSubTasks", [])
 
-    # Per-milestone elapsed time, plus the total deployment time so far
-    # (sum across milestones — they run back-to-back). milestone_labels[i] is
-    # the parenthesised individual time, e.g. "(23 minutes)", or None.
+    # Per-milestone elapsed time. milestone_labels[i] is the parenthesised
+    # individual time, e.g. "(23 minutes)", or None when unparseable.
     milestone_labels = []
-    total_deployment_seconds = 0
     for milestone in milestones:
         secs = elapsed_seconds(
             milestone.get("creationTimestamp"),
@@ -3087,11 +3134,14 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
         if secs is None:
             milestone_labels.append(None)
             continue
-        total_deployment_seconds += secs
         label = format_seconds(secs)
         if milestone.get("status") == "IN_PROGRESS":
             label = f"{label} so far"
         milestone_labels.append(f"({label})")
+
+    # Total deployment time so far (sum across milestones) — same source the
+    # final summary uses, so the header and summary always agree.
+    total_deployment_seconds = sddc_milestones_elapsed_seconds(deployment_data) or 0
 
     # Build the main status line. While running, show a blue spinner +
     # IN_PROGRESS and the live total deployment time; terminal states show
