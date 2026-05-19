@@ -9,7 +9,7 @@ import math
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -21,6 +21,7 @@ from jinja2 import Template
 from rich.console import Console
 from rich.live import Live
 from rich.pretty import Pretty
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 from typing_extensions import Annotated
@@ -36,6 +37,35 @@ app = typer.Typer(
 console = Console()
 global_debug = False
 monitoring_active = False
+
+
+class _TimestampedLogFile:
+    """File wrapper that prefixes every written line with a [timestamp].
+
+    Rich's Console writes content in arbitrary chunks (sometimes a partial
+    line, sometimes several lines at once), so writes are tracked on line
+    boundaries and a timestamp is emitted at the start of each line. Any
+    other file attribute (flush, isatty, encoding, ...) proxies to the
+    underlying handle.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+        self._at_line_start = True
+
+    def write(self, text):
+        if not text:
+            return
+        chunks = []
+        for line in text.splitlines(keepends=True):
+            if self._at_line_start:
+                chunks.append(datetime.now().strftime("[%Y-%m-%d %H:%M:%S] "))
+            chunks.append(line)
+            self._at_line_start = line.endswith("\n")
+        self._handle.write("".join(chunks))
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
 
 
 class DebugConsole:
@@ -61,7 +91,7 @@ class DebugConsole:
         self._file_handle = open(path, "w", encoding="utf-8")
         self.logfile_path = path
         self._file_console = Console(
-            file=self._file_handle,
+            file=_TimestampedLogFile(self._file_handle),
             width=160,
             force_terminal=False,
             no_color=True,
@@ -550,6 +580,41 @@ def gather_zpod_info(zpod):
     return "\n".join(out)
 
 
+def summarize_response(result: Any) -> str:
+    """Build a compact one-line summary of an API response for the debug log.
+
+    Used in place of the full JSON dump for high-frequency polling calls so
+    the debug log stays small. Surfaces the status fields and progress counts
+    that actually matter when scanning a poll timeline.
+    """
+    if not isinstance(result, dict):
+        return f"{type(result).__name__} payload"
+
+    parts = [
+        f"{key}={result[key]}"
+        for key in ("status", "executionStatus", "resultStatus", "syncStatus")
+        if key in result
+    ]
+
+    milestones = result.get("milestones")
+    if isinstance(milestones, list) and milestones:
+        done = sum(
+            1 for m in milestones if m.get("status") == "COMPLETED_WITH_SUCCESS"
+        )
+        parts.append(f"milestones={done}/{len(milestones)}")
+
+    subtasks = result.get("sddcSubTasks")
+    if isinstance(subtasks, list) and subtasks:
+        done = sum(
+            1
+            for s in subtasks
+            if "COMPLETED_WITH_SUCCESS" in str(s.get("status", ""))
+        )
+        parts.append(f"subtasks={done}/{len(subtasks)}")
+
+    return ", ".join(parts) if parts else "(no status fields)"
+
+
 class VCFClient:
     """
     VCF API Client leveraging the VMware Cloud Foundation API.
@@ -764,11 +829,18 @@ class VCFClient:
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
         idempotent: bool = True,
+        log_response: bool = True,
     ) -> Dict[str, Any]:
         """Make API call with authentication and automatic token refresh.
 
         Pass ``idempotent=False`` for resource-creating POSTs so a timeout is
         not retried into a duplicate resource.
+
+        Pass ``log_response=False`` for high-frequency polling calls (the 5s
+        deployment/validation/depot status polls). Their full JSON bodies are
+        huge and near-identical across thousands of polls — dumping every one
+        is what bloated debug logs to hundreds of MB. A one-line summary is
+        logged instead; callers dump the full body once on a terminal status.
         """
         if not self.token:
             await self.get_token()
@@ -800,10 +872,18 @@ class VCFClient:
 
         result = response.json()
         if global_debug:
-            debug_console.print(
-                f"[dim]Response ({response.status_code}): "
-                f"{json.dumps(result, indent=2)}[/dim]"
-            )
+            if log_response:
+                debug_console.print(
+                    f"[dim]Response ({response.status_code}): "
+                    f"{json.dumps(result, indent=2)}[/dim]"
+                )
+            else:
+                # High-frequency poll: log a compact one-liner instead of the
+                # full body. Callers dump the full JSON once on terminal state.
+                debug_console.print(
+                    f"[dim]Response ({response.status_code}) "
+                    f"{method} {endpoint}: {summarize_response(result)}[/dim]"
+                )
         return result
 
     async def close(self):
@@ -897,20 +977,33 @@ async def _deploy_entry(
         )
         write_vcf_template(vcf_json, output_file)
 
-        # Install the nested vSAN ESA mock-HW VIB on the ESXi hosts (VCF 9.1
-        # enables vSAN ESA, which needs this on nested hardware). No-op for 9.0.
-        if is_vcf91(vcf_json):
-            await install_vsan_esa_mock_vib(vcf_json, zpod)
-
-        # Configure DNS
-        configure_dns(zpod_client, zpod_name, vcf_json)
-
-        # Create VCF API client for SDDC operations
+        # Create VCF API client for SDDC operations. Built early so we can
+        # detect whether a prior run already started validation/deployment.
         vcf_client = VCFClient(
             normalize_vcf_url(f"vcfinstaller.{zpod['domain']}"),
             "admin@local",
             zpod["password"],
         )
+
+        # Install the nested vSAN ESA mock-HW VIB on the ESXi hosts (VCF 9.1
+        # enables vSAN ESA, which needs this on nested hardware). No-op for 9.0.
+        #
+        # This step needs SSH on the ESXi hosts, but the VCF Installer disables
+        # ESXi SSH once a validation/deployment POST has been issued. On a retry
+        # of a deployment that already reached that point, the VIB is already
+        # installed — skip it rather than fail on a closed SSH port.
+        if is_vcf91(vcf_json):
+            if await sddc_operation_started(vcf_client):
+                console.print(
+                    "[cyan]ℹ️ Existing validation/deployment detected — "
+                    "skipping vSAN ESA mock-HW VIB install (ESXi SSH is "
+                    "disabled once VCF deployment has started).[/cyan]"
+                )
+            else:
+                await install_vsan_esa_mock_vib(vcf_json, zpod)
+
+        # Configure DNS
+        configure_dns(zpod_client, zpod_name, vcf_json)
 
         # Configure VCF depot and download bundles
         await configure_vcf_depot_and_bundles(
@@ -1005,6 +1098,34 @@ async def _deploy_entry(
 
     finally:
         zpod_client.close()
+
+
+async def sddc_operation_started(client: VCFClient) -> bool:
+    """
+    Check whether a validation or SDDC deployment has already been started.
+
+    Used to decide whether SSH-dependent pre-deployment steps (such as the
+    vSAN ESA mock-HW VIB install) can still run: the VCF Installer disables
+    ESXi SSH once a validation/deployment POST has been issued, so once either
+    exists those steps must be skipped on a retry.
+
+    Args:
+        client: VCF client instance
+
+    Returns:
+        bool: True if a validation or SDDC deployment already exists
+    """
+    for path in ("/v1/sddcs/validations/latest", "/v1/sddcs/latest"):
+        try:
+            result = await client.api_call("GET", path)
+            if result and "id" in result:
+                return True
+        except Exception as e:
+            if global_debug:
+                debug_console.print(
+                    f"[yellow]⚠️ Error checking {path}: {e}[/yellow]"
+                )
+    return False
 
 
 async def check_latest_validation(client: VCFClient) -> bool:
@@ -1861,6 +1982,7 @@ async def wait_for_depot_sync(client: VCFClient):
             sync_info = await client.api_call(
                 "GET",
                 "/v1/system/settings/depot/depot-sync-info",
+                log_response=False,  # polled every 5s — see api_call()
             )
             sync_status = sync_info.get("syncStatus", "UNKNOWN")
 
@@ -2277,6 +2399,7 @@ async def monitor_download_progress(
                 status_response = await client.api_call(
                     "GET",
                     f"/v1/bundles/download-status?imageType=INSTALL&releaseVersion={version}",
+                    log_response=False,  # polled every 5s — see api_call()
                 )
 
                 if isinstance(status_response, dict) and "elements" in status_response:
@@ -2435,8 +2558,10 @@ async def initiate_sddc_validations(
         ) as live:
             while True:
                 try:
+                    # log_response=False: polled every 5s — see api_call().
                     sddc_val = await client.api_call(
-                        "GET", f"/v1/sddcs/validations/{sddc_val_id}"
+                        "GET", f"/v1/sddcs/validations/{sddc_val_id}",
+                        log_response=False,
                     )
 
                     # Update the live display
@@ -2445,6 +2570,13 @@ async def initiate_sddc_validations(
                     executionStatus = sddc_val["executionStatus"]
 
                     if executionStatus != "IN_PROGRESS":
+                        # Terminal state — dump the full payload once.
+                        if global_debug:
+                            debug_console.print(
+                                f"[dim]Final SDDC validation response "
+                                f"({executionStatus}):\n"
+                                f"{json.dumps(sddc_val, indent=2)}[/dim]"
+                            )
                         break
 
                     await asyncio.sleep(5)
@@ -2481,8 +2613,8 @@ async def initiate_sddc_validations(
         return
     elif executionStatus == "FAILED":
         console.print("\n[bold red]❌ SDDC validation failed[/bold red]")
-        if global_debug:
-            debug_console.print(Pretty(sddc_val))
+        # Full payload already dumped to the debug log on the
+        # terminal-state break above.
         raise typer.Exit(code=1)
 
     console.print(
@@ -2560,72 +2692,149 @@ async def initiate_sddc_deployment(
             f"[cyan]Monitoring existing SDDC deployment with ID: {sddc_id}[/cyan]"
         )
 
-    # Monitor deployment progress with live display
-    monitoring_active = True
-    live = None
+    # Monitor deployment progress with live display.
+    #
+    # A VCF deployment can end in COMPLETED_WITH_FAILURE on a transient or
+    # otherwise recoverable error; the installer supports resuming it via
+    # PATCH /v1/sddcs/{id}. Wrap the live monitor in a resume loop so a failed
+    # deployment is retried automatically in-flight — not only when the script
+    # is relaunched.
+    max_resume_attempts = 3
+    resume_attempt = 0
 
-    try:
-        with Live(
-            generate_deployment_status_display(),
-            refresh_per_second=2,
-            console=console,
-        ) as live:
-            while True:
-                try:
-                    sddc = await client.api_call("GET", f"/v1/sddcs/{sddc_id}")
+    while True:
+        monitoring_active = True
+        live = None
 
-                    # Update the live display
-                    live.update(generate_deployment_status_display(sddc))
+        try:
+            deployment_display = LiveDeploymentDisplay()
+            with Live(
+                deployment_display,
+                # 10 fps so the in-progress milestone spinner animates
+                # smoothly between the 5s-spaced API polls.
+                refresh_per_second=10,
+                console=console,
+            ) as live:
+                while True:
+                    try:
+                        # log_response=False: this GET is polled every 5s for
+                        # the whole (multi-hour) deployment — dumping its full
+                        # JSON each time is what bloated debug logs to 100s of
+                        # MB. The full body is dumped once on terminal status.
+                        sddc = await client.api_call(
+                            "GET", f"/v1/sddcs/{sddc_id}", log_response=False
+                        )
 
-                    # Check if sddcSubTasks exists
-                    if "sddcSubTasks" not in sddc:
+                        # Hand the fresh payload to the dynamic renderable;
+                        # Live re-renders it (and advances the spinner) at
+                        # refresh_per_second.
+                        deployment_display.sddc = sddc
+
+                        # Check if sddcSubTasks exists
+                        if "sddcSubTasks" not in sddc:
+                            await asyncio.sleep(5)
+                            continue
+
+                        sddc_status = sddc["status"]
+                        if sddc_status != "IN_PROGRESS":
+                            # Terminal state — dump the full payload once for
+                            # troubleshooting (per-poll dumps are suppressed).
+                            if global_debug:
+                                debug_console.print(
+                                    f"[dim]Final SDDC deployment response "
+                                    f"({sddc_status}):\n"
+                                    f"{json.dumps(sddc, indent=2)}[/dim]"
+                                )
+                            break
+
+                        await asyncio.sleep(5)
+
+                    except Exception as e:
+                        console.print(
+                            f"[red]Error checking deployment status: {e}[/red]"
+                        )
                         await asyncio.sleep(5)
                         continue
 
-                    sddc_status = sddc["status"]
-                    if sddc_status != "IN_PROGRESS":
-                        break
-
-                    await asyncio.sleep(5)
-
-                except Exception as e:
-                    console.print(f"[red]Error checking deployment status: {e}[/red]")
-                    await asyncio.sleep(5)
-                    continue
-
-    except KeyboardInterrupt:
-        if live:
-            live.stop()
-        console.print(
-            "\n\n⚠️ [yellow]Deployment monitoring interrupted by user (Ctrl+C)[/yellow]"
-        )
-        console.print("🔄 [blue]Stopping deployment monitoring...[/blue]")
-    except Exception as e:
-        if live:
-            live.stop()
-        console.print(f"\n❌ [red]Error in deployment monitoring: {e}[/red]")
-    finally:
-        if live and not live.is_started:
-            try:
+        except KeyboardInterrupt:
+            if live:
                 live.stop()
-            except Exception:
-                pass
-        monitoring_active = False
+            console.print(
+                "\n\n⚠️ [yellow]Deployment monitoring interrupted by user (Ctrl+C)[/yellow]"
+            )
+            console.print("🔄 [blue]Stopping deployment monitoring...[/blue]")
+            return
+        except Exception as e:
+            if live:
+                live.stop()
+            console.print(f"\n❌ [red]Error in deployment monitoring: {e}[/red]")
+            raise typer.Exit(code=1)
+        finally:
+            if live and not live.is_started:
+                try:
+                    live.stop()
+                except Exception:
+                    pass
+            monitoring_active = False
 
-    # Check final status
-    if sddc_status == "COMPLETED_WITH_SUCCESS":
-        console.print(
-            "\n[bold green]✅ SDDC deployment completed successfully![/bold green]"
-        )
-        return
-    elif sddc_status == "FAILED":
-        console.print("\n[bold red]❌ SDDC deployment failed[/bold red]")
-        if global_debug:
-            debug_console.print(Pretty(sddc))
+        # Deployment reached a terminal state — decide what to do next.
+        if sddc_status == "COMPLETED_WITH_SUCCESS":
+            console.print(
+                "\n[bold green]✅ SDDC deployment completed successfully![/bold green]"
+            )
+            return
+
+        if sddc_status == "COMPLETED_WITH_FAILURE":
+            if resume_attempt >= max_resume_attempts:
+                console.print(
+                    f"\n[bold red]❌ SDDC deployment still failing after "
+                    f"{max_resume_attempts} resume attempt(s)[/bold red]"
+                )
+                # Full payload already dumped to the debug log on the
+                # terminal-state break above.
+                raise typer.Exit(code=1)
+
+            resume_attempt += 1
+            console.print(
+                f"\n[yellow]⚠️ SDDC deployment ended with COMPLETED_WITH_FAILURE "
+                f"— resuming (attempt {resume_attempt}/{max_resume_attempts})..."
+                f"[/yellow]"
+            )
+            try:
+                await client.api_call("PATCH", f"/v1/sddcs/{sddc_id}")
+                console.print(
+                    "[bold green]✓ Deployment resume request sent successfully"
+                    "[/bold green]"
+                )
+            except Exception as e:
+                console.print(f"[bold red]❌ Resume request failed: {e}[/bold red]")
+                raise typer.Exit(code=1)
+
+            # The installer needs a moment to act on the PATCH and flip the
+            # deployment back to IN_PROGRESS. Wait for that before re-entering
+            # the live monitor, otherwise the first GET would still read
+            # COMPLETED_WITH_FAILURE and burn another resume attempt.
+            console.print("[cyan]⏳ Waiting for the installer to resume...[/cyan]")
+            for _ in range(24):  # up to ~2 minutes
+                await asyncio.sleep(5)
+                try:
+                    refreshed = await client.api_call(
+                        "GET", f"/v1/sddcs/{sddc_id}", log_response=False
+                    )
+                    if refreshed.get("status") == "IN_PROGRESS":
+                        break
+                except Exception:
+                    continue
+            continue
+
+        if sddc_status == "FAILED":
+            console.print("\n[bold red]❌ SDDC deployment failed[/bold red]")
+            # Full payload already dumped to the debug log on the
+            # terminal-state break above.
+            raise typer.Exit(code=1)
+
+        console.print(f"\n[bold red]❌ Unexpected status: {sddc_status}[/bold red]")
         raise typer.Exit(code=1)
-
-    console.print(f"\n[bold red]❌ Unexpected status: {sddc_status}[/bold red]")
-    raise typer.Exit(code=1)
 
 
 def generate_validation_status_display(validation_data: dict = None) -> Text:
@@ -2775,6 +2984,76 @@ def format_timestamp(timestamp_str: str) -> str:
         return "??:??:??"
 
 
+def elapsed_seconds(start_iso: str, end_iso: str = None) -> Optional[int]:
+    """
+    Compute the number of seconds between two ISO timestamps.
+
+    Args:
+        start_iso (str): ISO start timestamp
+        end_iso (str, optional): ISO end timestamp. Defaults to now (UTC)
+            when omitted — i.e. the milestone is still in progress.
+
+    Returns:
+        Optional[int]: Elapsed whole seconds, or None if unparseable.
+    """
+    try:
+        start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        if end_iso:
+            end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+        else:
+            end = datetime.now(timezone.utc)
+        return max(0, int((end - start).total_seconds()))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def format_seconds(total_seconds: int) -> str:
+    """Render a whole-second count as a human-readable duration.
+
+    Returns a string like "1 hour 55 minutes" / "23 minutes" / "8 seconds".
+    """
+
+    def _plural(value: int, unit: str) -> str:
+        return f"{value} {unit}" + ("" if value == 1 else "s")
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours:
+        return f"{_plural(hours, 'hour')} {_plural(minutes, 'minute')}"
+    if minutes:
+        return _plural(minutes, "minute")
+    return _plural(seconds, "second")
+
+
+# Rich's built-in "dots" spinner drives the in-progress milestone indicator.
+# rich.spinner.Spinner is a block renderable, so it can't be embedded inline
+# in a Text — instead we let it own the frame set and timing and just pull
+# the current glyph for the milestone line.
+_MILESTONE_SPINNER = Spinner("dots")
+
+
+def _spinner_frame() -> str:
+    """Return the current 'dots' spinner glyph for the wall-clock time."""
+    return _MILESTONE_SPINNER.render(time.time()).plain
+
+
+class LiveDeploymentDisplay:
+    """Dynamic renderable wrapper for the deployment status display.
+
+    Holding the SDDC payload behind a renderable — rather than handing Live a
+    static Text — lets ``generate_deployment_status_display`` be re-invoked on
+    every Live refresh. That is what animates the in-progress milestone
+    spinner between the (5s-spaced) API polls.
+    """
+
+    def __init__(self, sddc: dict = None):
+        self.sddc = sddc
+
+    def __rich_console__(self, console, options):
+        yield generate_deployment_status_display(self.sddc)
+
+
 def generate_deployment_status_display(deployment_data: dict = None) -> Text:
     """
     Generate a formatted display for deployment status with milestones and subtasks.
@@ -2795,24 +3074,43 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
     milestones = deployment_data.get("milestones", [])
     sddc_subtasks = deployment_data.get("sddcSubTasks", [])
 
-    # Create the main status line
-    if status == "IN_PROGRESS":
-        status_color = "blue"
-        status_icon = "▶"
-    elif status == "COMPLETED_WITH_SUCCESS":
-        status_color = "green"
-        status_icon = "✅"
-    elif status == "FAILED":
-        status_color = "red"
-        status_icon = "❌"
-    else:
-        status_color = "yellow"
-        status_icon = "⚠️"
+    # Per-milestone elapsed time, plus the total deployment time so far
+    # (sum across milestones — they run back-to-back). milestone_labels[i] is
+    # the parenthesised individual time, e.g. "(23 minutes)", or None.
+    milestone_labels = []
+    total_deployment_seconds = 0
+    for milestone in milestones:
+        secs = elapsed_seconds(
+            milestone.get("creationTimestamp"),
+            milestone.get("updateTimestamp"),
+        )
+        if secs is None:
+            milestone_labels.append(None)
+            continue
+        total_deployment_seconds += secs
+        label = format_seconds(secs)
+        if milestone.get("status") == "IN_PROGRESS":
+            label = f"{label} so far"
+        milestone_labels.append(f"({label})")
 
-    # Build the main status text (status text only)
+    # Build the main status line. While running, show a blue spinner +
+    # IN_PROGRESS and the live total deployment time; terminal states show
+    # the plain coloured status word.
     main_status = Text()
     main_status.append(f"{name}: ", style="bold white")
-    main_status.append(f"{status}", style=f"bold {status_color}")
+    if status == "IN_PROGRESS":
+        main_status.append(f"{_spinner_frame()} {status}", style="bold blue")
+        main_status.append(
+            f" (Current deployment time: "
+            f"{format_seconds(total_deployment_seconds)})",
+            style="yellow",
+        )
+    else:
+        status_color = {
+            "COMPLETED_WITH_SUCCESS": "green",
+            "FAILED": "red",
+        }.get(status, "yellow")
+        main_status.append(status, style=f"bold {status_color}")
 
     # If no milestones, just return the main status
     if not milestones:
@@ -2844,6 +3142,18 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
         max(len(name) for name in all_task_names) if all_task_names else 0
     )
 
+    # Width of the widest task-count badge, so the elapsed-time column lines
+    # up across milestones regardless of badge size (e.g. "(6/19)" vs
+    # "(133/133)").
+    max_badge_length = 0
+    for milestone in milestones:
+        total_tasks = milestone.get("totalTasks")
+        if total_tasks is not None:
+            completed_tasks = milestone.get("completedTasks", 0)
+            max_badge_length = max(
+                max_badge_length, len(f"({completed_tasks}/{total_tasks})")
+            )
+
     # Second pass: build the actual display with alignment
     for i, milestone in enumerate(milestones):
         milestone_name = milestone.get("name", "Unknown Milestone")
@@ -2855,7 +3165,7 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
             milestone_icon = "✓"
         elif milestone_status == "IN_PROGRESS":
             milestone_color = "blue"
-            milestone_icon = "▶"
+            milestone_icon = _spinner_frame()
         elif milestone_status == "FAILED":
             milestone_color = "red"
             milestone_icon = "✗"
@@ -2885,10 +3195,24 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
         total_tasks = milestone.get("totalTasks")
         if total_tasks is not None:
             completed_tasks = milestone.get("completedTasks", 0)
+            badge = f"({completed_tasks}/{total_tasks})"
             milestones_text.append(" ", style="white")
+            milestones_text.append(badge, style="dim cyan")
+        else:
+            badge = ""
+            if max_badge_length:
+                milestones_text.append(" ", style="white")
+
+        # Add the milestone's elapsed time: total wall-clock for a finished
+        # milestone (updateTimestamp marks completion), or "so far" while it
+        # is still running. The badge above is right-padded to a fixed width
+        # so this elapsed-time column lines up across all milestones.
+        duration_label = milestone_labels[i]
+        if duration_label:
             milestones_text.append(
-                f"({completed_tasks}/{total_tasks})", style="dim cyan"
+                " " * (max_badge_length - len(badge) + 1), style="white"
             )
+            milestones_text.append(duration_label, style="dim")
 
         # If milestone is in progress, show its subtasks
         if milestone_status == "IN_PROGRESS":
