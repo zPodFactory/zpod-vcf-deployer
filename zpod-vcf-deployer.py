@@ -37,11 +37,16 @@ app = typer.Typer(
 console = Console()
 global_debug = False
 monitoring_active = False
-# Real VCF deployment time (seconds), derived from the SDDC milestones once a
-# deployment reaches a terminal state. Used for the final summary instead of
-# the script wall-clock, which under-counts when the script is relaunched to
-# monitor an already-running deployment. None until a deployment finishes.
+# SDDC milestone span (seconds), set when initiate_sddc_deployment reaches a
+# terminal state. Drives the "Deploying SDDC completed in" line — script
+# wall-clock under-counts it on a resumed run.
 final_deployment_seconds = None
+# ISO timestamps spanning the full deployment, captured from the APIs so that
+# the bottom "Total deployment time" is accurate even when the script is
+# relaunched: zPodFactory's /zpods returns creation_date for the start, and
+# the last VCF milestone's updateTimestamp marks the end.
+zpod_creation_iso = None
+sddc_end_iso = None
 
 
 class _TimestampedLogFile:
@@ -395,14 +400,21 @@ def main(
         )
     finally:
         end_time = time.perf_counter()
-        # Prefer the real VCF deployment time derived from the SDDC milestones.
-        # The script wall-clock under-counts when the script is relaunched to
-        # monitor an already-running deployment, so it is only a fallback
-        # (e.g. when no deployment reached a terminal state this run).
-        if final_deployment_seconds is not None:
-            time_str = format_time(final_deployment_seconds)
-        else:
-            time_str = format_time(end_time - start_time)
+        # Prefer the true end-to-end span: zPod creation_date → last VCF
+        # milestone updateTimestamp. That covers zPod creation + depot
+        # config + validation + deployment, and is accurate even on a
+        # relaunched/resumed run. Fall back to the SDDC milestone span if
+        # the zPod creation date wasn't captured, then to script wall-clock.
+        total_seconds = None
+        if zpod_creation_iso and sddc_end_iso:
+            total_seconds = elapsed_seconds(zpod_creation_iso, sddc_end_iso)
+        if total_seconds is None:
+            total_seconds = (
+                final_deployment_seconds
+                if final_deployment_seconds is not None
+                else end_time - start_time
+            )
+        time_str = format_time(total_seconds)
         console.print(
             f"[bold green]✅ Total deployment time: {time_str}[/bold green]"
         )
@@ -1283,12 +1295,14 @@ async def deploy_zpod(
     endpoint_name: str,
 ):
     """Deploy zPod"""
+    global zpod_creation_iso
     console.print(f"[bold cyan]🚀 Deploying zPod: {zpod_name}[/bold cyan]")
 
     zpod = zpod_client.get(f"/zpods/name={zpod_name}").json()
     if zpod.get("status") == "ACTIVE":
         console.print("[bold green]✓ zPod is already active[/bold green]")
         console.print(gather_zpod_info(zpod))
+        zpod_creation_iso = zpod.get("creation_date")
         return zpod
 
     endpoint = zpod_client.get(f"/endpoints/name={endpoint_name}").json()
@@ -1323,6 +1337,7 @@ async def deploy_zpod(
 
     if status == "ACTIVE":
         console.print("[bold green]✅ zPod deployment successful![/bold green]")
+        zpod_creation_iso = zpod.get("creation_date")
         return zpod
     elif status == "DEPLOY_FAILED":
         console.print("[bold red]❌ zPod Deployment Failed[/bold red]")
@@ -2644,7 +2659,7 @@ async def initiate_sddc_deployment(
     Raises:
         typer.Exit: On deployment failures or errors
     """
-    global monitoring_active, final_deployment_seconds
+    global monitoring_active, final_deployment_seconds, sddc_end_iso
 
     # Create new deployment if no sddc_id provided
     if not sddc_id:
@@ -2743,10 +2758,21 @@ async def initiate_sddc_deployment(
                         if sddc_status != "IN_PROGRESS":
                             # Terminal state — record the real (milestone-
                             # derived) deployment time for the final summary,
-                            # and dump the full payload once for
+                            # the absolute SDDC end timestamp (latest
+                            # milestone updateTimestamp) so main() can pair
+                            # it with the zPod creation_date for the true
+                            # total, and dump the full payload once for
                             # troubleshooting (per-poll dumps are suppressed).
                             final_deployment_seconds = (
                                 sddc_milestones_elapsed_seconds(sddc)
+                            )
+                            sddc_end_iso = max(
+                                (
+                                    m["updateTimestamp"]
+                                    for m in (sddc.get("milestones") or [])
+                                    if m.get("updateTimestamp")
+                                ),
+                                default=None,
                             )
                             if global_debug:
                                 debug_console.print(
@@ -3007,8 +3033,15 @@ def elapsed_seconds(start_iso: str, end_iso: str = None) -> Optional[int]:
     """
     try:
         start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            # zPodFactory stores creation_date as a naive datetime built from
+            # datetime.now(UTC); attach UTC so it can be subtracted from the
+            # tz-aware VCF milestone timestamps.
+            start = start.replace(tzinfo=timezone.utc)
         if end_iso:
             end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=timezone.utc)
         else:
             end = datetime.now(timezone.utc)
         return max(0, int((end - start).total_seconds()))
