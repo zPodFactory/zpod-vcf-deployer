@@ -24,7 +24,9 @@ That said, 100+ VCF instances for trainings, labs, architecture & design testing
   - **Online**: A Broadcom download token that will allow to pull all components from the Broadcom website directly
   - **Offline**: A VCF depot server (see [doc-vcf-offlinedepot](https://github.com/tsugliani/doc-vcf-offlinedepot) for setup instructions)
 
-No manual Python environment setup is needed. The script uses [PEP 723](https://peps.python.org/pep-0723/) inline metadata, so `uv run` automatically installs all dependencies (httpx, rich, typer, jinja2, python-dotenv).
+No manual Python environment setup is needed. The script uses [PEP 723](https://peps.python.org/pep-0723/) inline metadata, so `uv run` automatically installs all dependencies (httpx, rich, typer, jinja2, python-dotenv, asyncssh).
+
+Both **VCF 9.0.x** and **VCF 9.1.x** are supported. The deployer auto-detects the version family from the `version` field of the selected template and adapts its behavior (DNS records, depot components, ESXi preparation, progress display) accordingly.
 
 ## Quick Start
 
@@ -76,7 +78,13 @@ All settings can be configured in a `.env` file (loaded automatically) or passed
 |----------|-------------|
 | `VCF_DEPOT_MODE` | `online` or `offline` |
 
-**If using online mode:**
+> ⚠️ **VCF 9.1+ requires offline depot.** Starting with 9.1, VMware replaced the
+> online depot with a new activation system, so online mode no longer works. The
+> deployer detects a 9.1+ template and exits early if `--depot-mode online` is
+> set — use the offline depot for 9.1 and later. Online mode remains valid for
+> 9.0.x.
+
+**If using online mode (9.0.x only):**
 
 | Variable | Description |
 |----------|-------------|
@@ -91,12 +99,9 @@ All settings can be configured in a `.env` file (loaded automatically) or passed
 | `VCF_OFFLINE_DEPOT_PASSWORD` | Offline depot password |
 | `VCF_OFFLINE_DEPOT_PORT` | Offline depot port (default: `443`) |
 
-### Optional Settings
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `VCF_SKU` | `VCF` | VCF SKU — `VCF` (standard) or `VVF` (VMware validated) |
-| `VCF_VERSION` | `9.0.2.0` | VCF version to deploy |
+> The VCF release version and SKU are **not** environment/CLI settings — they
+> are read from the template's mandatory top-level `version` and `workflowType`
+> keys (`workflowType` is `VCF` or `VVF`).
 
 ### Example `.env` (offline depot)
 
@@ -116,10 +121,6 @@ VCF_OFFLINE_DEPOT_HOSTNAME=offlinedepot.corp.com
 VCF_OFFLINE_DEPOT_USERNAME=username
 VCF_OFFLINE_DEPOT_PASSWORD=password
 VCF_OFFLINE_DEPOT_PORT=443
-
-# VCF
-VCF_SKU=VCF
-VCF_VERSION=9.0.2.0
 ```
 
 > [!TIP]
@@ -139,7 +140,27 @@ uv run zpod-vcf-deployer.py -n demo
 uv run zpod-vcf-deployer.py -n demo --debug
 ```
 
-Debug mode logs full API request/response details for troubleshooting.
+`--debug` prints full API request/response details (headers, payloads, responses) to the screen for troubleshooting.
+
+### With debug logging to a file
+
+```bash
+uv run zpod-vcf-deployer.py -n demo --debug-log
+```
+
+`--debug-log` writes the same verbose debug detail to a timestamped log file in the current directory (e.g. `zpod-vcf-deployer-demo-20260515-143022.log`) while keeping the on-screen output clean. `--debug` and `--debug-log` can be combined to get both.
+
+### Validate only, deploy later
+
+```bash
+# 1) Provision + validate the SDDC spec, then stop before deployment
+uv run zpod-vcf-deployer.py -n demo -j config/v9.1.0.0_std_3hosts.json -p vcf-910-3hosts --verify-only
+
+# 2) When ready, re-run WITHOUT --verify-only to deploy the validated spec
+uv run zpod-vcf-deployer.py -n demo -j config/v9.1.0.0_std_3hosts.json -p vcf-910-3hosts
+```
+
+`--verify-only` stops right after `✅ SDDC validation completed successfully`, before any SDDC deployment is created. Re-running without the flag picks up the existing validation and proceeds straight to deployment — it does not re-validate from scratch. If a deployment already exists, `--verify-only` is a no-op and reports so.
 
 ### Override `.env` values via CLI
 
@@ -147,10 +168,13 @@ Any `.env` setting can be overridden on the command line:
 
 ```bash
 uv run zpod-vcf-deployer.py -n demo \
-  --vcf-json-template config/v901_std_3hosts.json \
-  --zpodfactory-profile vcf-901-3hosts \
-  --vcf-version 9.0.1.0
+  --vcf-json-template config/v9.0.1.0_std_3hosts.json \
+  --zpodfactory-profile vcf-901-3hosts
 ```
+
+> The VCF release version and SKU are taken from the template's mandatory
+> top-level `version` and `workflowType` keys — there are no `--vcf-version`
+> or `--vcf-sku` flags.
 
 ### Help
 
@@ -199,10 +223,10 @@ uv run zpod-vcf-deployer.py --help
 │    --offline-depot-hostname               TEXT      Offline depot hostname [env var: VCF_OFFLINE_DEPOT_HOSTNAME]                          │
 │    --offline-depot-username               TEXT      Offline depot username [env var: VCF_OFFLINE_DEPOT_USERNAME]                          │
 │    --offline-depot-password               TEXT      Offline depot password [env var: VCF_OFFLINE_DEPOT_PASSWORD]                          │
-│    --vcf-sku                              TEXT      VCF SKU (VCF or VVF) [env var: VCF_SKU] [default: VCF]                                │
-│    --vcf-version                          TEXT      VCF version [env var: VCF_VERSION] [default: 9.0.0.0]                                 │
 │    --offline-depot-port                   INTEGER   Offline depot port [env var: VCF_OFFLINE_DEPOT_PORT] [default: 443]                   │
-│    --debug                        -d                Enable debug output (API headers, payloads, responses)                                │
+│    --verify-only                                    Run the SDDC validation and stop before deployment                                     │
+│    --debug                        -d                Enable debug output on screen (API headers, payloads, responses)                       │
+│    --debug-log                                      Write debug output to a timestamped log file in the current directory                  │
 │    --version                                        Show the version and exit.                                                            │
 │    --install-completion                             Install completion for the current shell.                                             │
 │    --show-completion                                Show completion for the current shell, to copy it or customize the installation.      │
@@ -227,21 +251,32 @@ uv run zpod-vcf-deployer.py --help
 | `--offline-depot-username` | | `VCF_OFFLINE_DEPOT_USERNAME` | Offline depot username |
 | `--offline-depot-password` | | `VCF_OFFLINE_DEPOT_PASSWORD` | Offline depot password |
 | `--offline-depot-port` | | `VCF_OFFLINE_DEPOT_PORT` | Offline depot port |
-| `--vcf-sku` | | `VCF_SKU` | `VCF` or `VVF` |
-| `--vcf-version` | | `VCF_VERSION` | VCF version |
-| `--debug` | `-d` | — | Enable debug output |
+| `--verify-only` | | — | Run the SDDC validation and stop before deployment (re-run without it to deploy the last validated spec) |
+| `--debug` | `-d` | — | Enable debug output on screen |
+| `--debug-log` | | — | Write debug output to a timestamped log file |
 | `--version` | | — | Show version and exit |
 
 ## Available Templates
 
-| Template | VCF Version | Hosts | Description |
-|----------|-------------|-------|-------------|
-| `config/v900_std_3hosts.json` | 9.0.0 | 3 | Standard 3-host deployment |
-| `config/v901_std_3hosts.json` | 9.0.1 | 3 | Standard 3-host deployment |
-| `config/v901_std_4hosts.json` | 9.0.1 | 4 | Standard 4-host deployment |
-| `config/v902_std_3hosts.json` | 9.0.2 | 3 | Standard 3-host deployment |
+| Template | Release | Hosts | Component pins | Description |
+|----------|---------|-------|----------------|-------------|
+| `config/v9.0.0.0_std_3hosts.json` | 9.0.0.0 | 3 | GA (full versions) | GA |
+| `config/v9.0.1.0_std_3hosts.json` | 9.0.1.0 | 3 | GA (full versions) | GA |
+| `config/v9.0.1.0_std_4hosts.json` | 9.0.1.0 | 4 | GA (full versions) | GA — standard 4-host deployment |
+| `config/v9.0.2.0_std_3hosts.json` | 9.0.2.0 | 3 | GA (full versions) | GA |
+| `config/v9.1.0.0_std_3hosts.json` | 9.1.0.0 | 3 | GA (full versions) | GA (vSAN ESA, VCF Services Platform) |
+| `config/v9.1-latest_std_3hosts.json` | 9.1.0.0 | 3 | none (omitted) | Latest of the **9.1.x** line — deploys the newest available per component (incl. express patches) |
 
 Templates are Jinja2-enabled JSON files. Variables like `{{zpod_name}}`, `{{zpod_domain}}`, and `{{zpod_password}}` are automatically populated from the zPod configuration at deploy time.
+
+**Version pinning.** Two flavors:
+
+- **GA configs** pin every component spec to its full, build-qualified GA `productVersion` (e.g. `9.1.0.0.25370922`) as returned by the depot's `release-components` API. One per maintenance release (`9.0.0.0`, `9.0.1.0`, `9.0.2.0`, `9.1.0.0`).
+- **`-latest` configs omit `version`**, so the Installer deploys the newest available version per component (its documented default — per [William Lam's VCF 9.1 quick tip](https://williamlam.com/2026/06/vcf-9-1-quick-tip-understanding-vcf-installer-default-behavior-for-vcf-patch-releases.html)), including express patches. The top-level `version` points at the newest maintenance release of the line (`v9.1-latest` → `9.1.0.0`); bump it when a newer one ships (`9.1.1`…) — there is no auto-discovery.
+
+> **Express patches at bring-up are 9.1+ only.** VCF **9.0.x** rejects patch component versions during initial deployment (`FAILED_TO_VALIDATE_COMPONENT_VERSION_NO_PATCH_VERSIONS_ALLOWED`) — on that line you deploy GA and patch afterward via LCM, so there is no 9.0 `-latest` template. VCF **9.1+** (new activation system) accepts express-patch versions at bring-up, which is why `v9.1-latest` deploys `…0100` builds directly.
+
+> GA build numbers are specific to the depot they were generated from. If you point at a different depot whose builds differ, regenerate the GA pins (the `-latest` config carries no build numbers, so it never goes stale).
 
 Those VCF templates match zPodFactory profiles, here is a sample one used for small deployments
 
@@ -318,11 +353,12 @@ When you run the deployer, it executes these steps in order:
 
 1. **Provision zPod** — Creates a new zPod via the zPodFactory API and waits for it to become active
 2. **Render VCF config** — Processes the Jinja2 template with zPod-specific variables (network, domain, passwords)
-3. **Configure DNS** — Creates DNS records for all VCF components (vCenter, NSX, ESXi hosts, SDDC Manager)
-4. **Set up VCF depot** — Configures the online or offline depot on the VCF installer
-5. **Download bundles** — Downloads required VCF bundles (ESXi, vCenter, NSX-T, etc.)
-6. **Validate SDDC** — Runs VCF validation checks on the SDDC spec with live status tracking
-7. **Deploy SDDC** — Deploys the SDDC with real-time milestone progress display
+3. **Prepare ESXi hosts** *(VCF 9.1 only)* — Installs the [nested vSAN ESA mock-HW VIB](https://github.com/lamw/nested-vsan-esa-mock-hw-vib) on each ESXi host over SSH, since VCF 9.1 enables vSAN ESA on nested hardware. Idempotent — skips hosts that already have the VIB.
+4. **Configure DNS** — Creates DNS records for all VCF components (vCenter, NSX, ESXi hosts, SDDC Manager)
+5. **Set up VCF depot** — Configures the online or offline depot on the VCF installer
+6. **Download bundles** — Downloads required VCF bundles (ESXi, vCenter, NSX-T, etc.)
+7. **Validate SDDC** — Runs VCF validation checks on the SDDC spec with live status tracking
+8. **Deploy SDDC** — Deploys the SDDC with real-time milestone progress display
 
 Each step is timed and reported. The full deployment typically takes a few hours depending on bundle download speeds and environment performance. You can safely interrupt with `Ctrl+C` — the deployer handles graceful shutdown.
 
