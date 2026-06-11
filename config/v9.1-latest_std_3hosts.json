@@ -35,7 +35,6 @@
     "storageSize": "lstorage",
     "ssoDomain": "{{zpod_domain}}",
     "adminUserSsoPassword": "{{zpod_password}}",
-    "version": "9.1.0.0.25370922",
     "useExistingDeployment": false
   },
   "clusterSpec": {
@@ -117,7 +116,6 @@
         "privateTgwIpBlockCidr": "172.31.0.0/16"
       }
     },
-    "version": "9.1.0.0.25318225",
     "useExistingDeployment": false
   },
   "networkSpecs": [
@@ -208,7 +206,6 @@
     "hostname": "sddcmgr.{{zpod_domain}}",
     "sshPassword": "{{zpod_password}}",
     "localUserPassword": "{{zpod_password}}",
-    "version": "9.1.0.0.25371088",
     "useExistingDeployment": false
   },
   "managementPoolName": "mgmt-domain-np01",

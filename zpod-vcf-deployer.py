@@ -109,10 +109,6 @@ class DebugConsole:
             soft_wrap=False,
         )
 
-    @property
-    def active(self):
-        return self._screen is not None or self._file_console is not None
-
     def print(self, *args, **kwargs):
         if self._screen is not None:
             self._screen.print(*args, **kwargs)
@@ -271,22 +267,6 @@ def main(
             envvar="VCF_OFFLINE_DEPOT_PASSWORD",
         ),
     ] = None,
-    vcf_sku: Annotated[
-        str,
-        typer.Option(
-            "--vcf-sku",
-            help="VCF SKU (VCF or VVF)",
-            envvar="VCF_SKU",
-        ),
-    ] = "VCF",
-    vcf_version: Annotated[
-        str,
-        typer.Option(
-            "--vcf-version",
-            help="VCF version",
-            envvar="VCF_VERSION",
-        ),
-    ] = "9.0.0.0",
     offline_depot_port: Annotated[
         int,
         typer.Option(
@@ -295,6 +275,12 @@ def main(
             envvar="VCF_OFFLINE_DEPOT_PORT",
         ),
     ] = 443,
+    verify_only: bool = typer.Option(
+        False,
+        "--verify-only",
+        help="Run the SDDC validation and stop before deployment. Re-run "
+        "without this flag to deploy the last validated SDDC spec.",
+    ),
     debug: bool = typer.Option(
         False,
         "--debug",
@@ -341,26 +327,18 @@ def main(
             f"[bold yellow]Debug logging enabled → {logfile}[/bold yellow]"
         )
 
-    # Validate VCF SKU
-    if vcf_sku.upper() not in ("VCF", "VVF"):
-        typer.secho(
-            "[red]Error: --vcf-sku must be either 'VCF' or 'VVF'[/red]", err=True
-        )
-        raise typer.Exit(code=1)
-
     # Validate depot mode and required parameters
     if depot_mode.lower() not in ("online", "offline"):
-        typer.secho(
-            "[red]Error: --depot-mode must be either 'online' or 'offline'[/red]",
-            err=True,
+        console.print(
+            "[bold red]❌ --depot-mode must be either 'online' or 'offline'[/bold red]"
         )
         raise typer.Exit(code=1)
 
     if depot_mode.lower() == "online":
         if not online_depot_download_token:
-            typer.secho(
-                "[red]Error: --online-depot-download-token is required for online mode[/red]",
-                err=True,
+            console.print(
+                "[bold red]❌ --online-depot-download-token is required for "
+                "online mode[/bold red]"
             )
             raise typer.Exit(code=1)
     else:  # offline mode
@@ -369,9 +347,10 @@ def main(
             or not offline_depot_username
             or not offline_depot_password
         ):
-            typer.secho(
-                "[red]Error: --offline-depot-hostname, --offline-depot-username, and --offline-depot-password are required for offline mode[/red]",
-                err=True,
+            console.print(
+                "[bold red]❌ --offline-depot-hostname, --offline-depot-username, "
+                "and --offline-depot-password are required for offline "
+                "mode[/bold red]"
             )
             raise typer.Exit(code=1)
 
@@ -394,8 +373,7 @@ def main(
                 offline_depot_username=offline_depot_username,
                 offline_depot_password=offline_depot_password,
                 offline_depot_port=offline_depot_port,
-                vcf_sku=vcf_sku,
-                vcf_version=vcf_version,
+                verify_only=verify_only,
             )
         )
     finally:
@@ -479,7 +457,7 @@ def timeit(func):
 
         # Always show timing for major steps
         console.print(
-            f"[bold green]✅ {step_name} completed in {time_str}[/bold green]"
+            f"[bold green]✓ {step_name} completed in {time_str}[/bold green]"
         )
 
         # Additional debug info if debug mode is enabled
@@ -684,12 +662,13 @@ class VCFClient:
         attempt: int,
         max_retries: int,
         retry_delay: int,
-        operation_name: str = "operation",
     ) -> bool:
         """Handle connection errors with retry logic"""
         if attempt < max_retries - 1:
             error_msg = f"{type(error).__name__}"
-            console.print(
+            # Transient — retries automatically; keep it off the normal console
+            # (it only alarms the user) and log it for troubleshooting.
+            debug_console.print(
                 f"[yellow]⚠️ Service error, "
                 f"Retrying in {retry_delay} seconds... "
                 f"(Attempt {attempt + 1:2d}/{max_retries}) - {error_msg}[/yellow]"
@@ -774,7 +753,7 @@ class VCFClient:
                     and attempt < max_retries - 1
                 ):
                     error_type = f"HTTP {e.response.status_code}"
-                    console.print(
+                    debug_console.print(
                         f"[yellow]⚠️ Service error, "
                         f"Retrying in {retry_delay} seconds... "
                         f"(Attempt {attempt + 1:2d}/{max_retries}) - {error_type}[/yellow]"
@@ -807,7 +786,7 @@ class VCFClient:
                         f"[red]Connection error: {type(e).__name__}: {str(e)}[/red]"
                     )
                 if await self._handle_connection_error(
-                    e, attempt, max_retries, retry_delay, "Connection"
+                    e, attempt, max_retries, retry_delay
                 ):
                     continue
                 else:
@@ -819,11 +798,69 @@ class VCFClient:
                         f"[red]Unexpected error: {type(e).__name__}: {str(e)}[/red]"
                     )
                 if await self._handle_connection_error(
-                    e, attempt, max_retries, retry_delay, "Unexpected"
+                    e, attempt, max_retries, retry_delay
                 ):
                     continue
                 else:
                     raise
+
+    async def wait_until_ready(
+        self, max_wait: int = 600, poll_interval: int = 15
+    ) -> None:
+        """Poll the VCF Installer API until it answers.
+
+        The appliance returns ConnectError / HTTP 502-504 while it is still
+        booting. Without this gate each subsequent step absorbs that boot
+        window with its own per-call retry counter, which reads like a stuck
+        or looping retry. This is a single, clearly-labelled readiness phase so
+        those early retries are understood as "waiting for the installer", not
+        repeated failures of the same API call.
+
+        Treats connection errors and 502/503/504 as "still booting"; any other
+        HTTP response (even 401/404/405) means the API server is answering.
+        Returns once ready, or after ``max_wait`` seconds (then lets the normal
+        per-call retry logic take over).
+        """
+        probe = f"{self.base_url}/v1/system/settings/depot/depot-sync-info"
+        base_msg = (
+            "[bold cyan]⏳ Waiting for VCF Installer API to come online "
+            f"({self.base_url})…[/bold cyan]"
+        )
+        start = time.monotonic()
+        # A single in-place spinner instead of one printed line per poll, so the
+        # boot wait is one tidy status rather than a wall of "still booting" text.
+        with console.status(base_msg, spinner="dots"):
+            while True:
+                try:
+                    resp = await self.client.get(probe)
+                    if resp.status_code in (502, 503, 504):
+                        reason = f"HTTP {resp.status_code}"
+                    else:
+                        elapsed = int(time.monotonic() - start)
+                        console.print(
+                            "[bold green]✓ VCF Installer API is online "
+                            f"(after {elapsed}s)[/bold green]"
+                        )
+                        return
+                except (
+                    httpx.ConnectError,
+                    httpx.ConnectTimeout,
+                    httpx.ReadTimeout,
+                    httpx.WriteTimeout,
+                    httpx.RemoteProtocolError,
+                ) as e:
+                    reason = type(e).__name__
+                except Exception as e:
+                    reason = type(e).__name__
+
+                elapsed = int(time.monotonic() - start)
+                if elapsed >= max_wait:
+                    console.print(
+                        f"[yellow]⚠️ VCF Installer still not responding after "
+                        f"{elapsed}s ({reason}); proceeding anyway.[/yellow]"
+                    )
+                    return
+                await asyncio.sleep(poll_interval)
 
     async def get_token(self) -> str:
         """Get access token from VCF API with retry logic"""
@@ -924,6 +961,12 @@ class VCFClient:
         await self.client.aclose()
 
 
+def phase_banner(step: int, title: str) -> None:
+    """Labelled phase banner with a blank line before and after, to separate
+    automation phases."""
+    console.print(f"\n[bold cyan]━━ [{step}/7] {title} ━━[/bold cyan]\n")
+
+
 async def _deploy_entry(
     vcf_json_template: str,
     zpod_name: str,
@@ -937,8 +980,7 @@ async def _deploy_entry(
     offline_depot_username: str = None,
     offline_depot_password: str = None,
     offline_depot_port: int = 443,
-    vcf_sku: str = "VCF",
-    vcf_version: str = "9.0.0.0",
+    verify_only: bool = False,
 ):
     """
     Main deployment entry point orchestrating the entire VCF deployment process.
@@ -956,8 +998,12 @@ async def _deploy_entry(
         offline_depot_username (str, optional): Offline depot username
         offline_depot_password (str, optional): Offline depot password
         offline_depot_port (int, optional): Offline depot port (default: 443)
-        vcf_sku (str, optional): VCF SKU ('VCF' or 'VVF', default: 'VCF')
-        vcf_version (str, optional): VCF version (default: '9.0.0.0')
+        verify_only (bool, optional): Stop after SDDC validation, before
+            deployment (default: False)
+
+    The release version and SKU are read from the template's mandatory
+    top-level "version" and "workflowType" keys (no CLI flags).
+
     Raises:
         typer.Exit: On deployment failures
     """
@@ -966,19 +1012,42 @@ async def _deploy_entry(
     # Parse VCF JSON template
     vcf_template_data = json.loads(vcf_json_template.read())
 
-    # Warn if the --vcf-version flag's major.minor differs from the template's
-    # version family — the template version drives deployment behavior, while
-    # --vcf-version drives the depot/release-component API calls.
-    template_version = str(vcf_template_data.get("version", ""))
-    if template_version:
-        tmpl_family = template_version.split(".")[:2]
-        flag_family = str(vcf_version).split(".")[:2]
-        if tmpl_family != flag_family:
-            console.print(
-                f"[yellow]⚠️ --vcf-version ({vcf_version}) does not match the "
-                f"template version ({template_version}). Pass --vcf-version "
-                f"{template_version} to align the depot/bundle API calls.[/yellow]"
-            )
+    # The template's top-level "version" key is the single source of truth for
+    # the release version that drives the depot/release-component API calls.
+    vcf_version = str(vcf_template_data.get("version", "")).strip()
+    if not vcf_version:
+        console.print(
+            "[bold red]❌ Template is missing a top-level \"version\" key, which "
+            "is required to drive the depot/bundle API calls.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    # The SKU (VCF or VVF) likewise comes from the template's "workflowType"
+    # key; it selects the release line in the depot/release-component API.
+    vcf_sku = str(vcf_template_data.get("workflowType", "")).strip().upper()
+    if vcf_sku not in ("VCF", "VVF"):
+        console.print(
+            f"[bold red]❌ Template \"workflowType\" must be 'VCF' or 'VVF' "
+            f"(got {vcf_sku or 'empty'}).[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[dim]Using VCF version {vcf_version} ({vcf_sku}) from template[/dim]"
+    )
+
+    # VCF 9.1+ replaced the online depot with a new activation system, so the
+    # online depot mode no longer works there. Fail fast (before provisioning)
+    # and point the user at the offline depot.
+    if depot_mode.lower() == "online" and is_vcf91(vcf_template_data):
+        console.print(
+            f"[bold red]❌ Online depot mode is not supported for VCF "
+            f"{vcf_version}: 9.1 and later replaced it with a new activation "
+            "system. Use the offline depot instead (--depot-mode offline with "
+            "--offline-depot-hostname / --offline-depot-username / "
+            "--offline-depot-password).[/bold red]"
+        )
+        raise typer.Exit(code=1)
 
     # Create zPod client
     zpod_client = httpx.Client(
@@ -988,7 +1057,7 @@ async def _deploy_entry(
     )
 
     try:
-        # Deploy zPod
+        phase_banner(1, "zPod Deployment")
         zpod = await deploy_zpod(
             zpod_client=zpod_client,
             zpod_name=zpod_name,
@@ -999,7 +1068,7 @@ async def _deploy_entry(
         # Fetch zPodFactory host IP from settings API
         zpodfactory_ip = fetch_zpodfactory_host_ip(zpod_client)
 
-        # Build VCF template
+        phase_banner(2, "Preparing VCF Spec")
         vcf_json = build_vcf_template(
             zpod, json.dumps(vcf_template_data), zpodfactory_ip
         )
@@ -1018,6 +1087,14 @@ async def _deploy_entry(
             zpod["password"],
         )
 
+        # Wait for the freshly-provisioned VCF Installer appliance to finish
+        # booting before any API calls. Without this, the first few steps each
+        # ride out the boot window with their own retry counters, which looks
+        # like the same call looping. This is one clear readiness phase.
+        await vcf_client.wait_until_ready()
+
+        phase_banner(3, "Preparing ESXi hosts")
+
         # Install the nested vSAN ESA mock-HW VIB on the ESXi hosts (VCF 9.1
         # enables vSAN ESA, which needs this on nested hardware). No-op for 9.0.
         #
@@ -1034,11 +1111,15 @@ async def _deploy_entry(
                 )
             else:
                 await install_vsan_esa_mock_vib(vcf_json, zpod)
+        else:
+            console.print(
+                "[green]✓ No ESXi host preparation required (VCF 9.0.x)[/green]"
+            )
 
-        # Configure DNS
+        phase_banner(4, "Configuring DNS records")
         configure_dns(zpod_client, zpod_name, vcf_json)
 
-        # Configure VCF depot and download bundles
+        phase_banner(5, "Downloading VCF bundles")
         await configure_vcf_depot_and_bundles(
             zpod=zpod,
             depot_mode=depot_mode,
@@ -1053,32 +1134,51 @@ async def _deploy_entry(
         )
 
         # Check for existing validation first
-        latest_validation = await check_latest_validation(vcf_client)
+        debug_console.print("[cyan]🔍 Checking for existing validation...[/cyan]")
+        latest_validation = await get_latest_validation(vcf_client)
+        if latest_validation:
+            console.print(
+                f"[cyan]✓ Found existing validation "
+                f"({latest_validation.get('executionStatus', 'UNKNOWN')})[/cyan]"
+            )
+            debug_console.print(
+                f"[dim]Validation ID: {latest_validation['id']}[/dim]"
+            )
 
         if not latest_validation:
-            # No existing validation - launch validation
-            console.print(
-                "[cyan]No existing validation found. Starting validation...[/cyan]"
-            )
+            # No existing validation - launch a fresh validation + deployment.
             await _run_sddc_operations(
-                vcf_client, vcf_json, "Starting fresh validation and deployment"
+                vcf_client,
+                vcf_json,
+                "Starting fresh validation and deployment",
+                verify_only=verify_only,
             )
             return
 
         # Check for existing SDDC deployment
-        latest_sddc = await check_latest_sddc(vcf_client)
+        debug_console.print(
+            "[cyan]🔍 Checking for existing SDDC deployment...[/cyan]"
+        )
+        latest_sddc = await get_latest_sddc(vcf_client)
+        if latest_sddc:
+            console.print(
+                f"[cyan]✓ Found existing SDDC deployment "
+                f"({latest_sddc.get('status', 'UNKNOWN')})[/cyan]"
+            )
+            debug_console.print(
+                f"[dim]SDDC deployment ID: {latest_sddc['id']}[/dim]"
+            )
 
         if not latest_sddc:
             # No existing SDDC deployment - monitor validation and then deploy
-            console.print(
-                "[cyan]Found existing validation. Monitoring validation...[/cyan]"
-            )
-            validation_id = await get_latest_validation_id(vcf_client)
             await initiate_sddc_validations(
                 client=vcf_client,
                 vcf_json=vcf_json,
-                validation_id=validation_id,
+                validation_id=latest_validation["id"],
             )
+            if verify_only:
+                _print_verify_only_stop()
+                return
             # After validation completes, proceed to deployment
             await initiate_sddc_deployment(
                 client=vcf_client,
@@ -1087,7 +1187,15 @@ async def _deploy_entry(
             return
 
         # Found existing SDDC deployment - check status and handle accordingly
-        detected_sddc_id = await get_latest_sddc_id(vcf_client)
+        detected_sddc_id = latest_sddc["id"]
+
+        if verify_only:
+            console.print(
+                f"[yellow]⚠️ --verify-only: an SDDC deployment already exists "
+                f"({detected_sddc_id}); validation is already complete. Re-run "
+                "without --verify-only to monitor/resume deployment.[/yellow]"
+            )
+            return
 
         # Get the current deployment status to determine if we need to resume
         try:
@@ -1161,109 +1269,50 @@ async def sddc_operation_started(client: VCFClient) -> bool:
     return False
 
 
-async def check_latest_validation(client: VCFClient) -> bool:
-    """
-    Check for the latest validation task.
+async def _get_latest(client: VCFClient, path: str, label: str) -> Optional[dict]:
+    """GET a '…/latest' SDDC resource, returning it only if it carries an id.
 
-    Args:
-        client: VCF client instance
-
-    Returns:
-        bool: True if validation exists with valid ID, False otherwise
+    Returns None when nothing exists yet or the call fails — these endpoints
+    legitimately error before the first validation/deployment is created.
+    Callers use truthiness for "does it exist?" and ``["id"]`` for the id, so a
+    single fetch serves both (no second round-trip).
     """
     try:
-        console.print("[cyan]🔍 Checking for existing validation...[/cyan]")
-        latest_validation = await client.api_call("GET", "/v1/sddcs/validations/latest")
-
-        if latest_validation and "id" in latest_validation:
-            console.print(
-                f"[cyan]✓ Found existing validation with ID: {latest_validation['id']}[/cyan]"
-            )
-            console.print(
-                f"[cyan]Validation status: {latest_validation.get('executionStatus', 'UNKNOWN')}[/cyan]"
-            )
-            return True
-        else:
-            return False
+        result = await client.api_call("GET", path)
+        return result if result and "id" in result else None
     except Exception as e:
         if global_debug:
             debug_console.print(
-                f"[yellow]⚠️ Error checking for existing validation: {e}[/yellow]"
+                f"[yellow]⚠️ Error fetching latest {label}: {e}[/yellow]"
             )
-        return False
-
-
-async def get_latest_validation_id(client: VCFClient) -> Optional[str]:
-    """
-    Get the ID of the latest validation task.
-
-    Args:
-        client: VCF client instance
-
-    Returns:
-        Optional[str]: Validation ID if found, None otherwise
-    """
-    try:
-        latest_validation = await client.api_call("GET", "/v1/sddcs/validations/latest")
-        return latest_validation.get("id") if latest_validation else None
-    except Exception as e:
-        if global_debug:
-            debug_console.print(f"[yellow]⚠️ Error getting validation ID: {e}[/yellow]")
         return None
 
 
-async def check_latest_sddc(client: VCFClient) -> bool:
-    """
-    Check for the latest SDDC deployment task.
-
-    Args:
-        client: VCF client instance
-
-    Returns:
-        bool: True if SDDC deployment exists with valid ID, False otherwise
-    """
-    try:
-        console.print("[cyan]🔍 Checking for existing SDDC deployment...[/cyan]")
-        latest_sddc = await client.api_call("GET", "/v1/sddcs/latest")
-
-        if latest_sddc and "id" in latest_sddc:
-            console.print(
-                f"[cyan]✓ Found existing SDDC deployment with ID: {latest_sddc['id']}[/cyan]"
-            )
-            console.print(
-                f"[cyan]Latest deployment status: {latest_sddc.get('status', 'UNKNOWN')}[/cyan]"
-            )
-            return True
-        else:
-            return False
-    except Exception as e:
-        if global_debug:
-            debug_console.print(
-                f"[yellow]⚠️ Error checking for existing SDDC deployment: {e}[/yellow]"
-            )
-        return False
+async def get_latest_validation(client: VCFClient) -> Optional[dict]:
+    """Latest SDDC validation object, or None if none yet / on error."""
+    return await _get_latest(client, "/v1/sddcs/validations/latest", "validation")
 
 
-async def get_latest_sddc_id(client: VCFClient) -> Optional[str]:
-    """
-    Get the ID of the latest SDDC deployment task.
-
-    Args:
-        client: VCF client instance
-
-    Returns:
-        Optional[str]: SDDC ID if found, None otherwise
-    """
-    try:
-        latest_sddc = await client.api_call("GET", "/v1/sddcs/latest")
-        return latest_sddc.get("id") if latest_sddc else None
-    except Exception as e:
-        if global_debug:
-            debug_console.print(f"[yellow]⚠️ Error getting SDDC ID: {e}[/yellow]")
-        return None
+async def get_latest_sddc(client: VCFClient) -> Optional[dict]:
+    """Latest SDDC deployment object, or None if none yet / on error."""
+    return await _get_latest(client, "/v1/sddcs/latest", "SDDC deployment")
 
 
-async def _run_sddc_operations(client: VCFClient, vcf_json: dict, message: str):
+def _print_verify_only_stop():
+    """Report that we stopped after validation due to --verify-only."""
+    console.print(
+        "\n[bold green]✅ --verify-only: SDDC validation complete, stopping "
+        "before deployment.[/bold green]"
+    )
+    console.print(
+        "[cyan]Re-run without --verify-only to deploy the validated SDDC "
+        "spec.[/cyan]"
+    )
+
+
+async def _run_sddc_operations(
+    client: VCFClient, vcf_json: dict, message: str, verify_only: bool = False
+):
     """
     Helper function to run SDDC validation and deployment operations.
 
@@ -1271,8 +1320,9 @@ async def _run_sddc_operations(client: VCFClient, vcf_json: dict, message: str):
         client: VCF client instance
         vcf_json: VCF template JSON
         message: Message to display before starting operations
+        verify_only: When True, stop after validation without deploying
     """
-    console.print(
+    debug_console.print(
         f"[cyan]{message}. Proceeding with validation and new deployment...[/cyan]"
     )
 
@@ -1281,6 +1331,9 @@ async def _run_sddc_operations(client: VCFClient, vcf_json: dict, message: str):
         client=client,
         vcf_json=vcf_json,
     )
+    if verify_only:
+        _print_verify_only_stop()
+        return
     await initiate_sddc_deployment(
         client=client,
         vcf_json=vcf_json,
@@ -1336,7 +1389,8 @@ async def deploy_zpod(
             await asyncio.sleep(10)
 
     if status == "ACTIVE":
-        console.print("[bold green]✅ zPod deployment successful![/bold green]")
+        # Success + timing is reported by the @timeit wrapper as
+        # "✅ Creating zPod completed in …", so no separate success line here.
         zpod_creation_iso = zpod.get("creation_date")
         return zpod
     elif status == "DEPLOY_FAILED":
@@ -1358,7 +1412,9 @@ def fetch_zpodfactory_host_ip(zpod_client: httpx.Client) -> str:
     Returns:
         str: The zPodFactory host IP address
     """
-    console.print("[cyan]🔍 Fetching zPodFactory host IP from settings...[/cyan]")
+    debug_console.print(
+        "[cyan]🔍 Fetching zPodFactory host IP from settings...[/cyan]"
+    )
     response = zpod_client.get("/settings/name=zpodfactory_host")
     response.raise_for_status()
     data = response.json()
@@ -1368,7 +1424,7 @@ def fetch_zpodfactory_host_ip(zpod_client: httpx.Client) -> str:
             "[bold red]❌ zpodfactory_host setting returned empty value[/bold red]"
         )
         raise typer.Exit(code=1)
-    console.print(f"[green]✓ zPodFactory host IP: {ip}[/green]")
+    debug_console.print(f"[green]✓ zPodFactory host IP: {ip}[/green]")
     return ip
 
 
@@ -1453,7 +1509,7 @@ def is_vcf91(vcf_json: dict) -> bool:
 
 def build_vcf_template(zpod, tmpl, zpodfactory_ip: str):
     """Build VCF template with zpod variables"""
-    console.print("[bold cyan]📋 Building VCF template...[/bold cyan]")
+    debug_console.print("[bold cyan]📋 Building VCF template...[/bold cyan]")
 
     # Validate zpodfactory_ip is provided
     if not zpodfactory_ip:
@@ -1527,7 +1583,8 @@ def build_vcf_template(zpod, tmpl, zpodfactory_ip: str):
 
 def write_vcf_template(vcf_json, filename):
     """Write VCF template to file"""
-    console.print(f"[cyan]📄 Writing VCF template to: {filename}[/cyan]")
+    console.print("[bold cyan]📋 VCF template ready[/bold cyan]")
+    debug_console.print(f"[dim]Wrote VCF template to: {filename}[/dim]")
     with open(filename, "w") as f:
         json.dump(vcf_json, f, indent=2)
 
@@ -1659,9 +1716,6 @@ def configure_dns(
     """Configure DNS records for the zPod"""
     console.print("[bold cyan]🌐 Configuring DNS records...[/bold cyan]")
 
-    # Correspondence table for hostname to IP mapping (shared 9.0/9.1 table)
-    hostname_ip_mapping = HOSTNAME_IP_MAPPING
-
     def find_hostnames_in_json(obj, hostnames=None):
         """Recursively find all hostnames in JSON structure that contain the domain"""
         if hostnames is None:
@@ -1691,8 +1745,8 @@ def configure_dns(
         """Get IP address for hostname using correspondence table"""
         hostname_part = hostname.split(".")[0]
 
-        if hostname_part in hostname_ip_mapping:
-            ip_suffix = hostname_ip_mapping[hostname_part]
+        if hostname_part in HOSTNAME_IP_MAPPING:
+            ip_suffix = HOSTNAME_IP_MAPPING[hostname_part]
             ip_address = f"{zpod_subnet}.{ip_suffix}"
             return ip_address, hostname_part
 
@@ -1877,22 +1931,16 @@ async def configure_online_depot(client: VCFClient, download_token: str):
     Raises:
         Exception: On depot configuration failures
     """
-    console.print(
-        "[bold cyan]⚙️ Configuring depot settings for online mode...[/bold cyan]"
-    )
-
     depot_data = {"vmwareAccount": {"downloadToken": download_token}}
 
-    console.print(
-        f"[bold green]✓ Configuring depot for online mode:[/bold green]\n"
-        f"  [cyan]Download Token:[/cyan] {download_token[:20]}...{download_token[-4:] if len(download_token) > 24 else ''}"
+    debug_console.print(
+        "[dim]Configuring online depot — download token: "
+        f"{download_token[:20]}...{download_token[-4:] if len(download_token) > 24 else ''}[/dim]"
     )
 
     try:
         await client.api_call("PUT", "/v1/system/settings/depot", depot_data)
-        console.print(
-            "[bold green]✓ Depot settings updated for online mode[/bold green]"
-        )
+        console.print("[bold green]✓ Online depot configured[/bold green]")
     except Exception as e:
         console.print(
             f"[bold red]❌ Failed to configure depot settings: {e}[/bold red]"
@@ -1921,10 +1969,6 @@ async def configure_offline_depot(
     Raises:
         Exception: On depot configuration failures
     """
-    console.print(
-        "[bold cyan]⚙️ Configuring depot settings for offline mode...[/bold cyan]"
-    )
-
     depot_data = {
         "offlineAccount": {
             "username": username,
@@ -1938,20 +1982,21 @@ async def configure_offline_depot(
         },
     }
 
-    # Obfuscate password for display
+    # Full settings (password obfuscated) go to the debug log only.
     obfuscated_password = "*" * len(password) if password else ""
-    console.print(
-        f"[bold green]✓ Configuring depot for offline mode:[/bold green]\n"
-        f"  [cyan]Hostname:[/cyan] {hostname}\n"
-        f"  [cyan]Username:[/cyan] {username}\n"
-        f"  [cyan]Password:[/cyan] {obfuscated_password}\n"
-        f"  [cyan]Port:[/cyan] {port}"
+    debug_console.print(
+        "[dim]Configuring offline depot:\n"
+        f"  Hostname: {hostname}\n"
+        f"  Username: {username}\n"
+        f"  Password: {obfuscated_password}\n"
+        f"  Port: {port}[/dim]"
     )
 
     try:
         await client.api_call("PUT", "/v1/system/settings/depot", depot_data)
         console.print(
-            "[bold green]✓ Depot settings updated for offline mode[/bold green]"
+            f"[bold green]✓ Offline depot configured[/bold green] "
+            f"[cyan]({hostname})[/cyan]"
         )
     except Exception as e:
         console.print(
@@ -1967,25 +2012,23 @@ async def configure_offline_depot(
 
 async def handle_depot_sync(client: VCFClient):
     """Handle depot sync operations"""
-    console.print("[bold cyan]🔄 Checking depot sync status...[/bold cyan]")
+    debug_console.print("[bold cyan]🔄 Checking depot sync status...[/bold cyan]")
 
     try:
         sync_info = await client.api_call(
             "GET", "/v1/system/settings/depot/depot-sync-info"
         )
         sync_status = sync_info.get("syncStatus", "UNKNOWN")
-        console.print(f"[bold green]✓ Depot sync status: {sync_status}[/bold green]")
+        debug_console.print(f"[dim]Depot sync status: {sync_status}[/dim]")
 
-        if sync_status == "UNSYNCED":
-            console.print(
-                "[bold yellow]⚠️ Depot is not in sync. Triggering depot sync...[/bold yellow]"
-            )
+        if sync_status == "SYNCED":
+            console.print("[bold green]✓ Depot already in sync[/bold green]")
+        elif sync_status == "UNSYNCED":
             await trigger_depot_sync(client)
             await wait_for_depot_sync(client)
-        elif sync_status == "SYNCED":
-            console.print("[bold green]✅ Depot is already in sync![/bold green]")
         else:
-            console.print(f"[yellow]⚠️ Depot sync status: {sync_status}[/yellow]")
+            # Unexpected/intermediate state — monitor it to completion.
+            await wait_for_depot_sync(client)
 
     except Exception as e:
         console.print(f"[bold red]❌ Failed to check depot sync info: {e}[/bold red]")
@@ -1998,7 +2041,7 @@ async def trigger_depot_sync(client: VCFClient):
     """Trigger depot sync"""
     try:
         await client.api_call("PATCH", "/v1/system/settings/depot/depot-sync-info")
-        console.print("[bold green]✅ Depot sync triggered successfully![/bold green]")
+        debug_console.print("[dim]✓ Depot sync triggered[/dim]")
     except Exception as e:
         console.print(f"[yellow]⚠️ Could not trigger depot sync: {e}[/yellow]")
         if global_debug:
@@ -2007,45 +2050,47 @@ async def trigger_depot_sync(client: VCFClient):
 
 
 async def wait_for_depot_sync(client: VCFClient):
-    """Wait for depot to sync with status monitoring"""
-    console.print("\n[bold cyan]⏳ Waiting for depot to sync...[/bold cyan]")
-    console.print("[dim]This may take several seconds. Please wait...[/dim]")
-    console.print("[yellow]Press Ctrl+C to interrupt at any time.[/yellow]")
+    """Wait for the depot to sync, shown as a single in-place spinner.
 
-    while True:
-        try:
-            sync_info = await client.api_call(
-                "GET",
-                "/v1/system/settings/depot/depot-sync-info",
-                log_response=False,  # polled every 5s — see api_call()
-            )
-            sync_status = sync_info.get("syncStatus", "UNKNOWN")
-
-            if sync_status == "SYNCED":
-                console.print("[bold green]✅ Depot is now in sync![/bold green]")
-                break
-            elif sync_status == "SYNCING":
-                console.print("[cyan]🔄 Depot is syncing...[/cyan]")
-            elif sync_status == "SYNC_FAILED":
-                console.print("[bold red]❌ Depot sync failed![/bold red]")
-                console.print(
-                    "[yellow]Please check your depot configuration and try again.[/yellow]"
+    Per-poll status lines go to the debug log; the screen shows one spinner that
+    resolves to a single success/failure line.
+    """
+    failed = False
+    with console.status("[bold cyan]⏳ Syncing depot…[/bold cyan]", spinner="dots"):
+        while True:
+            try:
+                sync_info = await client.api_call(
+                    "GET",
+                    "/v1/system/settings/depot/depot-sync-info",
+                    log_response=False,  # polled every 10s — see api_call()
                 )
-                if global_debug:
-                    debug_console.print(
-                        f"[red]Sync info: {json.dumps(sync_info, indent=2)}[/red]"
-                    )
-                return
-            else:
-                console.print(f"[yellow]⏳ Depot status: {sync_status}[/yellow]")
+                sync_status = sync_info.get("syncStatus", "UNKNOWN")
+                debug_console.print(f"[dim]Depot sync status: {sync_status}[/dim]")
+
+                if sync_status == "SYNCED":
+                    break
+                if sync_status == "SYNC_FAILED":
+                    failed = True
+                    if global_debug:
+                        debug_console.print(
+                            f"[red]Sync info: {json.dumps(sync_info, indent=2)}[/red]"
+                        )
+                    break
+            except Exception as e:
+                debug_console.print(
+                    f"[red]Error checking depot sync status: "
+                    f"{type(e).__name__}: {e}[/red]"
+                )
 
             await asyncio.sleep(10)
 
-        except Exception as e:
-            console.print(f"[red]Error checking depot sync status: {e}[/red]")
-            if global_debug:
-                debug_console.print(f"[red]Error details: {type(e).__name__}: {str(e)}[/red]")
-            await asyncio.sleep(10)
+    if failed:
+        console.print("[bold red]❌ Depot sync failed![/bold red]")
+        console.print(
+            "[yellow]Please check your depot configuration and try again.[/yellow]"
+        )
+        return
+    console.print("[bold green]✓ Depot synced[/bold green]")
 
 
 def get_required_components(vcf_json: dict) -> set:
@@ -2061,16 +2106,40 @@ def get_required_components(vcf_json: dict) -> set:
     Returns:
         Set of required component names matching the VCF release API
     """
-    # Mapping from VCF JSON spec keys to API component names (shared 9.0/9.1
-    # table). A spec key can map to multiple components.
-    spec_to_components = SPEC_TO_COMPONENTS
-
+    # SPEC_TO_COMPONENTS maps VCF JSON spec keys to API component names
+    # (shared 9.0/9.1 table); a spec key can map to multiple components.
     required = set()
-    for spec_key, component_names in spec_to_components.items():
+    for spec_key, component_names in SPEC_TO_COMPONENTS.items():
         if spec_key in vcf_json:
             required.update(component_names)
 
     return required
+
+
+def get_component_version_overrides(vcf_json: dict) -> Dict[str, str]:
+    """Map component name -> pinned version string from spec ``version`` fields.
+
+    Per William Lam's VCF 9.1 quick tip, the VCF Installer API defaults to the
+    component versions you have downloaded (i.e. the latest), but a deployment
+    spec section may carry an explicit ``version`` property to pin a specific
+    component version, e.g.::
+
+        "vcfOperationsCollectorSpec": { ..., "version": "9.1.0" }
+
+    When present, that pin must drive which bundle gets downloaded instead of
+    the latest. We reuse SPEC_TO_COMPONENTS to translate spec keys to the
+    release-API component names.
+    """
+    overrides = {}
+    for spec_key, component_names in SPEC_TO_COMPONENTS.items():
+        spec = vcf_json.get(spec_key)
+        if isinstance(spec, dict):
+            pinned = spec.get("version")
+            if pinned:
+                for name in component_names:
+                    overrides[name] = str(pinned)
+
+    return overrides
 
 
 async def handle_bundle_operations(
@@ -2089,8 +2158,13 @@ async def handle_bundle_operations(
             f"releaseVersion={vcf_version}&imageType=INSTALL",
         )
 
-        # Parse components
-        vcf_components = parse_vcf_components(release_components_response)
+        # Parse components, honoring any per-component version pins from the spec
+        version_overrides = (
+            get_component_version_overrides(vcf_json) if vcf_json else {}
+        )
+        vcf_components = parse_vcf_components(
+            release_components_response, version_overrides
+        )
 
         if not vcf_components:
             console.print("[bold red]❌ No VCF components found. Exiting.[/bold red]")
@@ -2128,7 +2202,7 @@ async def handle_bundle_operations(
             console.print("[dim]No downloads needed.[/dim]")
         else:
             # Initiate downloads for bundles with PENDING status
-            download_results = await initiate_bundle_downloads(
+            await initiate_bundle_downloads(
                 client, bundles_to_download, bundle_status_map
             )
 
@@ -2138,7 +2212,7 @@ async def handle_bundle_operations(
                     "[yellow]Press Ctrl+C to interrupt monitoring at any time.[/yellow]"
                 )
                 await monitor_download_progress(
-                    client, vcf_components, download_results, vcf_version
+                    client, vcf_components, vcf_version
                 )
             else:
                 console.print(
@@ -2154,9 +2228,55 @@ async def handle_bundle_operations(
         raise
 
 
-def parse_vcf_components(release_components_response: Dict[str, Any]) -> Dict[str, Any]:
-    """Parse VCF components from API response"""
+def _version_sort_key(product_version: str) -> Tuple[int, ...]:
+    """Build a numeric sort key from a VCF productVersion string.
+
+    VCF 9.0+ uses the format X.Y.Z.AABC.<build> (see Broadcom KB 410435), where
+    higher numbers in earlier positions take precedence — e.g. the express-patch
+    release 9.1.0.0100.25426672 supersedes the GA 9.1.0.0.25318520. Splitting on
+    "." and comparing the segments as integers implements that ordering directly.
+    Non-numeric or missing segments fall back to -1 so they sort lowest.
+    """
+    parts = []
+    for segment in str(product_version).split("."):
+        parts.append(int(segment) if segment.isdigit() else -1)
+    return tuple(parts)
+
+
+def _latest_version(versions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return the newest version entry from a component's versions list."""
+    return max(
+        versions, key=lambda v: _version_sort_key(v.get("productVersion", ""))
+    )
+
+
+def _version_matches(product_version: str, pinned: str) -> bool:
+    """Return True if ``product_version`` matches the ``pinned`` spec version.
+
+    Matching is segment-wise (split on ".") so a pin is treated as a prefix on
+    dot boundaries: "9.1.0.0" matches the GA "9.1.0.0.25318520" but NOT the
+    express patch "9.1.0.0100.25426672", while "9.1.0.0100" matches only the
+    patch line and a coarse "9.1.0" matches both (the caller then keeps the
+    newest match). This avoids the false positives a raw string prefix would
+    cause (e.g. "9.1.0.0" string-prefixing "9.1.0.0100").
+    """
+    pv = str(product_version).split(".")
+    pin = str(pinned).split(".")
+    return pv[: len(pin)] == pin
+
+
+def parse_vcf_components(
+    release_components_response: Dict[str, Any],
+    version_overrides: Dict[str, str] = None,
+) -> Dict[str, Any]:
+    """Parse VCF components from API response.
+
+    ``version_overrides`` maps a component name to a pinned version string (from
+    a deployment spec's ``version`` field). For pinned components the matching
+    version's bundles are selected instead of the latest.
+    """
     vcf_components = {}
+    version_overrides = version_overrides or {}
 
     if (
         isinstance(release_components_response, dict)
@@ -2168,7 +2288,7 @@ def parse_vcf_components(release_components_response: Dict[str, Any]) -> Dict[st
             target_release = elements[0]
             if "components" in target_release:
                 components = target_release["components"]
-                console.print(
+                debug_console.print(
                     f"[bold green]✓ Found {len(components)} components[/bold green]"
                 )
 
@@ -2183,31 +2303,76 @@ def parse_vcf_components(release_components_response: Dict[str, Any]) -> Dict[st
                         "bundles": [],
                     }
 
-                    if "versions" in component and isinstance(
-                        component["versions"], list
+                    if (
+                        "versions" in component
+                        and isinstance(component["versions"], list)
+                        and component["versions"]
                     ):
-                        for version in component["versions"]:
-                            product_version = version.get("productVersion", "Unknown")
+                        versions = component["versions"]
+                        pinned = version_overrides.get(component_name)
+                        version = None
 
-                            if (
-                                "artifacts" in version
-                                and "bundles" in version["artifacts"]
-                            ):
-                                bundles = version["artifacts"]["bundles"]
-                                for bundle in bundles:
-                                    bundle_id = bundle.get("id", "Unknown")
-                                    bundle_name = bundle.get("name", "Unknown")
-                                    bundle_size = bundle.get("size", 0)
+                        # A spec may pin a specific component version; honor it
+                        # over the latest (William Lam VCF 9.1 quick tip).
+                        if pinned:
+                            matches = [
+                                v
+                                for v in versions
+                                if _version_matches(
+                                    v.get("productVersion", ""), pinned
+                                )
+                            ]
+                            if matches:
+                                version = _latest_version(matches)
+                                debug_console.print(
+                                    f"[dim]  {component_name}: using pinned version "
+                                    f"{version.get('productVersion', 'Unknown')} "
+                                    f"(spec version='{pinned}')[/dim]"
+                                )
+                            else:
+                                available = ", ".join(
+                                    v.get("productVersion", "?") for v in versions
+                                )
+                                console.print(
+                                    f"[bold yellow]⚠️ {component_name}: pinned version "
+                                    f"'{pinned}' not found among available versions "
+                                    f"({available}); falling back to latest[/bold yellow]"
+                                )
 
-                                    vcf_components[component_name]["bundles"].append(
-                                        {
-                                            "id": bundle_id,
-                                            "name": bundle_name,
-                                            "size": bundle_size,
-                                            "type": bundle.get("type", "Unknown"),
-                                            "productVersion": product_version,
-                                        }
-                                    )
+                        # Otherwise (or on a failed pin) only the newest version
+                        # of each component must be downloaded — older releases
+                        # (e.g. GA vs. express patch) are superseded. See
+                        # _version_sort_key / Broadcom KB 410435.
+                        if version is None:
+                            version = _latest_version(versions)
+                            if not pinned and len(versions) > 1:
+                                debug_console.print(
+                                    f"[dim]  {component_name}: selected latest version "
+                                    f"{version.get('productVersion', 'Unknown')} of "
+                                    f"{len(versions)} available[/dim]"
+                                )
+
+                        product_version = version.get("productVersion", "Unknown")
+
+                        if (
+                            "artifacts" in version
+                            and "bundles" in version["artifacts"]
+                        ):
+                            bundles = version["artifacts"]["bundles"]
+                            for bundle in bundles:
+                                bundle_id = bundle.get("id", "Unknown")
+                                bundle_name = bundle.get("name", "Unknown")
+                                bundle_size = bundle.get("size", 0)
+
+                                vcf_components[component_name]["bundles"].append(
+                                    {
+                                        "id": bundle_id,
+                                        "name": bundle_name,
+                                        "size": bundle_size,
+                                        "type": bundle.get("type", "Unknown"),
+                                        "productVersion": product_version,
+                                    }
+                                )
 
                 # Print summary
                 total_bundles = sum(
@@ -2256,8 +2421,10 @@ def analyze_bundle_status(
     vcf_components: Dict[str, Any], bundle_status_map: Dict[str, Any]
 ) -> Tuple[bool, List[Tuple[str, Dict[str, Any]]]]:
     """Analyze bundle download status and identify bundles to download"""
+    # Sort by component name so the download-initiation order (and its printed
+    # lines) is stable across runs, matching the status table.
     all_bundles = []
-    for comp_name, comp_data in vcf_components.items():
+    for comp_name, comp_data in sorted(vcf_components.items()):
         for bundle in comp_data["bundles"]:
             all_bundles.append((comp_name, bundle))
 
@@ -2271,7 +2438,7 @@ def analyze_bundle_status(
 
         if download_status != "SUCCESS":
             all_success = False
-            if download_status not in ("DOWNLOADING"):
+            if download_status not in ("DOWNLOADING",):
                 bundles_to_download.append((comp_name, bundle))
 
     return all_success, bundles_to_download
@@ -2282,69 +2449,40 @@ async def initiate_bundle_downloads(
     bundles_to_download: List[Tuple[str, Dict[str, Any]]],
     bundle_status_map: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Initiate downloads for bundles with PENDING status"""
-    console.print(
-        "\n[bold cyan]🚀 Checking bundle status and initiating downloads for PENDING bundles...[/bold cyan]"
-    )
+    """Initiate downloads for bundles with PENDING status.
+
+    Per-bundle progress is shown by the live "Bundle Depot Download Status"
+    table, so this stays silent on success and only reports a failure to
+    initiate a download.
+    """
     download_results = {}
-    successful_initiations = 0
 
     for comp_name, bundle in bundles_to_download:
         bundle_id = bundle["id"]
         bundle_status = bundle_status_map.get(bundle_id, {})
         download_status = bundle_status.get("downloadStatus", "UNKNOWN")
 
-        if download_status == "PENDING":
-            console.print(
-                f"  [cyan]{comp_name}:[/cyan] {bundle_id[:40]}... [yellow]initiating download (PENDING)[/yellow]"
+        if download_status != "PENDING":
+            continue
+
+        try:
+            download_payload = {"bundleDownloadSpec": {"downloadNow": True}}
+            result = await client.api_call(
+                "PATCH",
+                f"/v1/bundles/{bundle_id}",
+                download_payload,
             )
-
-            try:
-                download_payload = {"bundleDownloadSpec": {"downloadNow": True}}
-                result = await client.api_call(
-                    "PATCH",
-                    f"/v1/bundles/{bundle_id}",
-                    download_payload,
-                )
-                if comp_name not in download_results:
-                    download_results[comp_name] = []
-                download_results[comp_name].append(
-                    {
-                        "bundle_id": bundle_id,
-                        "status": "initiated",
-                        "result": result,
-                    }
-                )
-                successful_initiations += 1
-                console.print("    [bold green]✓ Download initiated[/bold green]")
-            except Exception as e:
-                if comp_name not in download_results:
-                    download_results[comp_name] = []
-                download_results[comp_name].append(
-                    {
-                        "bundle_id": bundle_id,
-                        "status": "error",
-                        "error": str(e),
-                    }
-                )
-                console.print(f"    [bold red]✗ Failed: {str(e)[:100]}...[/bold red]")
-        else:
-            console.print(
-                f"  [cyan]{comp_name}:[/cyan] {bundle_id[:40]}... [dim]skipping (status: {download_status})[/dim]"
+            download_results.setdefault(comp_name, []).append(
+                {"bundle_id": bundle_id, "status": "initiated", "result": result}
             )
-
-    total_attempts = len(
-        [
-            b
-            for _, b in bundles_to_download
-            if bundle_status_map.get(b["id"], {}).get("downloadStatus") == "PENDING"
-        ]
-    )
-
-    console.print(
-        f"\n[bold cyan]📊 Download Summary:[/bold cyan] {successful_initiations}/{total_attempts} "
-        "scheduled for download"
-    )
+        except Exception as e:
+            download_results.setdefault(comp_name, []).append(
+                {"bundle_id": bundle_id, "status": "error", "error": str(e)}
+            )
+            console.print(
+                f"[bold red]✗ Failed to initiate download for {comp_name} "
+                f"({bundle_id[:12]}…): {str(e)[:100]}[/bold red]"
+            )
 
     return download_results
 
@@ -2356,41 +2494,61 @@ def generate_status_table(
     table = Table(title="VCF Installer - Bundle Depot Download Status")
     table.add_column("Component", style="cyan", no_wrap=True)
     table.add_column("Product Name", style="green")
+    table.add_column("Version", style="green", no_wrap=True)
     table.add_column("Bundle ID", style="magenta", no_wrap=True)
     table.add_column("Size", style="blue", justify="right")
     table.add_column("Status", style="yellow", width=14)
 
-    for comp_name, comp_data in vcf_components.items():
+    # Sort by component name so row order is stable across runs (the API /
+    # download-completion order varies, which makes troubleshooting confusing).
+    for comp_name, comp_data in sorted(vcf_components.items()):
         public_name = comp_data.get("publicName", "")
         for bundle in comp_data["bundles"]:
             bundle_id = bundle["id"]
+            bundle_version = bundle["productVersion"]
+            total_size = bundle["size"]
             bundle_status_info = status_data.get(bundle_id, {})
             download_status = bundle_status_info.get("downloadStatus", "UNKNOWN")
             downloaded_size = bundle_status_info.get("downloadedSize", 0)
-            total_size = bundle["size"]
 
-            if downloaded_size > 0 and download_status == "INPROGRESS":
-                if total_size >= 0:
-                    percentage = min(100, int((downloaded_size / total_size) * 100))
-                    filled_length = int((percentage / 100) * 10)
-                    progress_bar = "█" * filled_length + "░" * (10 - filled_length)
-                    status_display = f"[blue]{progress_bar} {percentage}%[/blue]"
-            elif download_status == "SUCCESS":
-                status_display = "[green]SUCCESS[/green]"
-            elif download_status == "FAILED":
-                status_display = "[red]FAILED[/red]"
-            elif download_status == "PENDING":
-                status_display = "[grey]NOT DOWNLOADED[/grey]"
-            elif download_status == "SCHEDULED":
-                status_display = "[blue]SCHEDULED[/blue]"
-            elif download_status == "VALIDATING":
-                status_display = "[blue]VALIDATING...[/blue]"
+            # Static glyph colour shared with the other displays, but NO spinner
+            # here: a progress bar already conveys "in progress" for downloads.
+            color = status_indicator(download_status)[1]
+            in_progress = download_status in (
+                "INPROGRESS",
+                "DOWNLOADING",
+                "VALIDATING",
+            )
+            if (
+                download_status in ("INPROGRESS", "DOWNLOADING")
+                and downloaded_size > 0
+            ):
+                percentage = (
+                    min(100, int((downloaded_size / total_size) * 100))
+                    if total_size > 0
+                    else 0
+                )
+                filled_length = int((percentage / 100) * 10)
+                progress_bar = "█" * filled_length + "░" * (10 - filled_length)
+                status_display = f"[{color}]{progress_bar} {percentage}%[/{color}]"
             else:
-                status_display = f"[blue]{download_status}[/blue]"
+                label = {
+                    "SUCCESS": "SUCCESS",
+                    "FAILED": "FAILED",
+                    "PENDING": "NOT DOWNLOADED",
+                    "SCHEDULED": "SCHEDULED",
+                    "VALIDATING": "VALIDATING…",
+                }.get(download_status, download_status)
+                if in_progress:
+                    status_display = f"[{color}]{_spinner_frame()} {label}[/{color}]"
+                else:
+                    icon = status_indicator(download_status)[0]
+                    status_display = f"[{color}]{icon} {label}[/{color}]"
 
             table.add_row(
                 comp_name,
                 public_name,
+                bundle_version,
                 bundle_id,
                 format_size(total_size),
                 status_display,
@@ -2399,10 +2557,23 @@ def generate_status_table(
     return table
 
 
+class LiveDownloadDisplay:
+    """Dynamic renderable for the bundle download table so the in-progress
+    spinner (e.g. VALIDATING…) animates on every Live refresh instead of
+    freezing between the 5s-spaced polls. Progress bars only change on poll,
+    which is fine — they reflect real downloaded bytes."""
+
+    def __init__(self, vcf_components: Dict[str, Any]):
+        self.vcf_components = vcf_components
+        self.status_data: Dict[str, Any] = {}
+
+    def __rich_console__(self, console, options):
+        yield generate_status_table(self.vcf_components, self.status_data)
+
+
 async def monitor_download_progress(
     client: VCFClient,
     vcf_components: Dict[str, Any],
-    download_results: Dict[str, Any],
     version: str,
 ) -> None:
     """Monitor download progress for all bundles using live updating table"""
@@ -2410,7 +2581,10 @@ async def monitor_download_progress(
     monitoring_active = True
     live = None
     try:
-        live = Live(refresh_per_second=1, transient=False)
+        download_display = LiveDownloadDisplay(vcf_components)
+        # 12.5 fps so the in-progress spinner animates smoothly between the
+        # 5s-spaced polls (the renderable is dynamic, see the class).
+        live = Live(download_display, refresh_per_second=12.5, transient=False)
         live.start()
 
         while True:
@@ -2429,8 +2603,9 @@ async def monitor_download_progress(
                         if bundle_id:
                             status_data[bundle_id] = element
 
-                    table = generate_status_table(vcf_components, status_data)
-                    live.update(table)
+                    # Hand fresh status to the dynamic renderable; Live
+                    # re-renders it (advancing the spinner) each refresh.
+                    download_display.status_data = status_data
 
                     # Check if all downloads are complete
                     all_complete = True
@@ -2512,11 +2687,10 @@ async def monitor_download_progress(
             live.stop()
         console.print(f"\n❌ [red]Error in download monitoring: {e}[/red]")
     finally:
-        if live and not live.is_started:
-            try:
-                live.stop()
-            except Exception:
-                pass
+        # Guarantee cleanup: stop() is a no-op if the Live was never started or
+        # is already stopped, so this covers every exit path. Then clear the flag.
+        if live is not None:
+            live.stop()
         monitoring_active = False
 
 
@@ -2539,14 +2713,15 @@ async def initiate_sddc_validations(
     """
     global monitoring_active
 
+    phase_banner(6, "Validating SDDC Spec")
+
     if validation_id:
         console.print(
-            f"[bold cyan]🔍 Monitoring existing SDDC validation with ID: {validation_id}[/bold cyan]"
+            f"[bold cyan]📋 Monitoring existing SDDC validation "
+            f"(Validation ID: {validation_id})[/bold cyan]"
         )
         sddc_val_id = validation_id
     else:
-        console.print("[bold cyan]🔍 Initiating SDDC validations...[/bold cyan]")
-
         # Create new validation
         if global_debug:
             debug_console.print(f"[dim]Sending validation request with JSON payload:[/dim]")
@@ -2559,6 +2734,10 @@ async def initiate_sddc_validations(
                 "POST", "/v1/sddcs/validations", vcf_json, idempotent=False
             )
             sddc_val_id = response["id"]
+            console.print(
+                f"[bold cyan]📋 Initiating SDDC validations... "
+                f"(Validation ID: {sddc_val_id})[/bold cyan]"
+            )
         except Exception as e:
             if "403" in str(e):
                 console.print("[red]Validation in progress, try again later.[/red]")
@@ -2570,9 +2749,12 @@ async def initiate_sddc_validations(
     live = None
 
     try:
+        validation_display = LiveValidationDisplay()
         with Live(
-            generate_validation_status_display(),
-            refresh_per_second=2,
+            validation_display,
+            # 12.5 fps so the in-progress spinner animates smoothly between the
+            # 5s-spaced API polls (the renderable is dynamic, see the class).
+            refresh_per_second=12.5,
             console=console,
         ) as live:
             while True:
@@ -2583,8 +2765,9 @@ async def initiate_sddc_validations(
                         log_response=False,
                     )
 
-                    # Update the live display
-                    live.update(generate_validation_status_display(sddc_val))
+                    # Hand the fresh payload to the dynamic renderable; Live
+                    # re-renders it (advancing the spinner) at refresh_per_second.
+                    validation_display.validation = sddc_val
 
                     executionStatus = sddc_val["executionStatus"]
 
@@ -2617,11 +2800,10 @@ async def initiate_sddc_validations(
             live.stop()
         console.print(f"\n❌ [red]Error in validation monitoring: {e}[/red]")
     finally:
-        if live and not live.is_started:
-            try:
-                live.stop()
-            except Exception:
-                pass
+        # Guarantee cleanup: stop() is a no-op if the Live was never started or
+        # is already stopped, so this covers every exit path. Then clear the flag.
+        if live is not None:
+            live.stop()
         monitoring_active = False
 
     # Check final status
@@ -2661,13 +2843,14 @@ async def initiate_sddc_deployment(
     """
     global monitoring_active, final_deployment_seconds, sddc_end_iso
 
+    phase_banner(7, "Deploying SDDC")
+
     # Create new deployment if no sddc_id provided
     if not sddc_id:
-        console.print("[bold cyan]🚀 Initiating SDDC deployment...[/bold cyan]")
-
         # Guard against creating a duplicate: if a deployment already exists
         # (e.g. a previous run created one), attach to it instead of POSTing.
-        existing_id = await get_latest_sddc_id(client)
+        existing = await get_latest_sddc(client)
+        existing_id = existing["id"] if existing else None
         if existing_id:
             console.print(
                 f"[yellow]⚠️ An SDDC deployment already exists ({existing_id}) "
@@ -2675,16 +2858,13 @@ async def initiate_sddc_deployment(
             )
             sddc_id = existing_id
         else:
-            console.print("[cyan]Creating new SDDC deployment...[/cyan]")
+            debug_console.print("[cyan]Creating new SDDC deployment...[/cyan]")
             try:
                 # POST /v1/sddcs is NOT idempotent — attempt it exactly once.
                 sddc = await client.api_call(
                     "POST", "/v1/sddcs", vcf_json, idempotent=False
                 )
                 sddc_id = sddc["id"]
-                console.print(
-                    f"[cyan]✓ New SDDC deployment created with ID: {sddc_id}[/cyan]"
-                )
             except Exception as e:
                 # A timeout/error here may still mean the deployment was
                 # created server-side. Recover by querying the latest
@@ -2695,17 +2875,18 @@ async def initiate_sddc_deployment(
                     f"({type(e).__name__}). Checking whether it was created "
                     f"anyway...[/yellow]"
                 )
-                sddc_id = await get_latest_sddc_id(client)
-                if sddc_id:
-                    console.print(
-                        f"[cyan]✓ Deployment was created ({sddc_id}) — "
-                        f"attaching to it.[/cyan]"
-                    )
-                else:
+                recovered = await get_latest_sddc(client)
+                sddc_id = recovered["id"] if recovered else None
+                if not sddc_id:
                     console.print(
                         "[bold red]❌ SDDC deployment was not created.[/bold red]"
                     )
                     raise typer.Exit(code=1)
+
+        console.print(
+            f"[bold cyan]🚀 Initiating SDDC deployment... "
+            f"(SDDC ID: {sddc_id})[/bold cyan]"
+        )
     else:
         console.print(
             f"[cyan]Monitoring existing SDDC deployment with ID: {sddc_id}[/cyan]"
@@ -2729,9 +2910,9 @@ async def initiate_sddc_deployment(
             deployment_display = LiveDeploymentDisplay()
             with Live(
                 deployment_display,
-                # 10 fps so the in-progress milestone spinner animates
+                # 12.5 fps so the in-progress milestone spinner animates
                 # smoothly between the 5s-spaced API polls.
-                refresh_per_second=10,
+                refresh_per_second=12.5,
                 console=console,
             ) as live:
                 while True:
@@ -2805,11 +2986,10 @@ async def initiate_sddc_deployment(
             console.print(f"\n❌ [red]Error in deployment monitoring: {e}[/red]")
             raise typer.Exit(code=1)
         finally:
-            if live and not live.is_started:
-                try:
-                    live.stop()
-                except Exception:
-                    pass
+            # Guarantee cleanup: stop() is a no-op if not started / already
+            # stopped, covering every exit path. Then clear the flag.
+            if live is not None:
+                live.stop()
             monitoring_active = False
 
         # Deployment reached a terminal state — decide what to do next.
@@ -2884,95 +3064,44 @@ def generate_validation_status_display(validation_data: dict = None) -> Text:
     """
     # Handle empty or None data gracefully
     if not validation_data:
-        return Text("🔍 Waiting for validation data...", style="dim italic")
+        return Text("Waiting for validation data…", style="dim italic")
 
-    # Extract main status information
-    validation_id = validation_data.get("id", "Unknown")
-    description = "VCF Spec Validation Status"
-    execution_status = validation_data.get("executionStatus", "UNKNOWN")
-    result_status = validation_data.get("resultStatus", "UNKNOWN")
     validation_checks = validation_data.get("validationChecks", [])
 
-    # Create the main status line
-    if execution_status == "IN_PROGRESS":
-        status_color = "blue"
-        status_icon = "🔄"
-    elif execution_status == "COMPLETED":
-        status_color = "green"
-        status_icon = "✅"
-    elif execution_status == "FAILED":
-        status_color = "red"
-        status_icon = "❌"
-    else:
-        status_color = "yellow"
-        status_icon = "⚠️"
+    # Header label only (the per-check lines below carry the leading glyphs;
+    # the one-time "Initiating SDDC validations…" line carries the ID).
+    out = Text()
+    out.append("VCF Spec Validation Status:", style="bold white")
 
-    # Build the main status text
-    main_status = Text()
-    main_status.append(f"Validation ID: {validation_id}\n", style="bold cyan")
-    main_status.append(f"{description}: ", style="bold white")
-    main_status.append(f"{execution_status}", style=f"bold {status_color}")
-    main_status.append(" ")
-    main_status.append(status_icon)
-
-    # Add result status if different from execution status
-    if result_status != "UNKNOWN" and result_status != execution_status:
-        main_status.append(f" (Result: {result_status})", style="dim")
-
-    # If no validation checks, just return the main status
-    if not validation_checks:
-        return main_status
-
-    # Find the longest description for alignment
-    max_description_length = max(
-        len(check.get("description", "")) for check in validation_checks
-    )
-
-    # Build the validation checks list with aligned status
-    checks_text = Text()
-    for i, check in enumerate(validation_checks):
+    for check in validation_checks:
         check_description = check.get("description", "Unknown Check")
         check_status = check.get("resultStatus", "UNKNOWN")
 
-        # Determine color and icon for each check
-        if check_status == "SUCCEEDED":
-            check_color = "green"
-            check_icon = "✓"
-        elif check_status == "IN_PROGRESS":
-            check_color = "blue"
-            check_icon = "🔄"
-        elif check_status == "FAILED":
-            check_color = "red"
-            check_icon = "✗"
-        else:
-            check_color = "yellow"
-            check_icon = "?"
+        # Leading status glyph, consistent across displays.
+        cs = (check_status or "").upper()
+        if cs == "SUCCEEDED":
+            icon, color = "✓", "green"
+        elif "IN_PROGRESS" in cs:
+            icon, color = _spinner_frame(), "blue"
+        elif "FAIL" in cs or "ERROR" in cs:
+            icon, color = "✗", "red"
+        elif cs == "SKIPPED":
+            icon, color = "⊝", "bright_black"
+        else:  # UNKNOWN / not yet evaluated -> pending
+            icon, color = "◌", "bright_black"
 
-        # Add check line with aligned status
-        checks_text.append(f"  • {check_description}", style="white")
+        out.append("\n  ")
+        out.append(icon, style=f"bold {color}")
+        out.append(" ")
+        out.append(check_description, style="white")
 
-        # Pad with spaces to align the status column
-        padding_length = max_description_length - len(check_description) + 2
-        checks_text.append(" " * padding_length, style="white")
-
-        checks_text.append(f"{check_status}", style=f"bold {check_color}")
-        checks_text.append(" ")
-        checks_text.append(check_icon)
-
-        # Add error information if available and status is not SUCCEEDED.
-        # Render the nested errors as an indented tree, one per line, with the
-        # severity, the (suffix-stripped) error code, and the message.
+        # Error details for non-success checks: indented severity/code/message.
         if check_status != "SUCCEEDED" and check.get("errorResponse"):
-            error_response = check["errorResponse"]
-            nested_errors = error_response.get("nestedErrors", [])
+            nested_errors = check["errorResponse"].get("nestedErrors", [])
             if nested_errors:
-                checks_text.append(
-                    f" ({len(nested_errors)} error(s))", style="dim"
-                )
+                out.append(f" ({len(nested_errors)} error(s))", style="dim")
                 for err in nested_errors:
                     code = err.get("errorCode", "UNKNOWN")
-                    # errorCode is suffixed with ".warning" / ".error" —
-                    # split that off to get the severity and the bare code.
                     if "." in code:
                         base_code, _, suffix = code.rpartition(".")
                         severity = suffix.upper() if suffix else check_status
@@ -2982,23 +3111,13 @@ def generate_validation_status_display(validation_data: dict = None) -> Text:
                         "red" if severity in ("ERROR", "FAILED") else "yellow"
                     )
                     message = err.get("message", "")
-                    checks_text.append("\n")
-                    checks_text.append("   - ", style="dim")
-                    checks_text.append(severity, style=f"bold {sev_color}")
-                    checks_text.append(" - ", style="dim")
-                    checks_text.append(base_code, style=sev_color)
-                    checks_text.append(f": '{message}'", style="white")
+                    out.append("\n      - ", style="dim")
+                    out.append(severity, style=f"bold {sev_color}")
+                    out.append(" - ", style="dim")
+                    out.append(base_code, style=sev_color)
+                    out.append(f": '{message}'", style="white")
 
-        if i < len(validation_checks) - 1:
-            checks_text.append("\n")
-
-    # Combine main status and checks
-    full_text = Text()
-    full_text.append(main_status)
-    full_text.append("\n")
-    full_text.append(checks_text)
-
-    return full_text
+    return out
 
 
 def format_timestamp(timestamp_str: str) -> str:
@@ -3069,26 +3188,45 @@ def format_seconds(total_seconds: int) -> str:
 
 
 def sddc_milestones_elapsed_seconds(sddc: dict) -> Optional[int]:
-    """Total deployment time derived from an SDDC object's milestones.
+    """Wall-clock deployment time from an SDDC object.
 
-    Milestones run back-to-back, so this sums each milestone's wall-clock
-    duration — the real VCF deployment elapsed time, independent of when this
-    script started monitoring. That distinction matters for resumed
-    deployments, where a script wall-clock timer would under-count.
+    Spans from the earliest milestone ``creationTimestamp`` (falling back to the
+    SDDC's own ``creationTimestamp``) to:
 
-    Returns None when the milestones carry no usable timestamps.
+    * **now**, while the deployment is still in progress — the running milestone
+      has no ``updateTimestamp`` yet, so a ``max(updateTimestamp)`` span would
+      read ~0; we want a live counter from the start instead; or
+    * the latest milestone ``updateTimestamp`` once terminal — the true total.
+      NOT the sum of per-milestone durations: milestones have gaps and some
+      9.0.x ones report ``creation == update``, which summing undercounts. The
+      span matches the subtask span and is independent of when monitoring began.
+
+    Returns None when no usable start timestamp is present.
     """
-    total = 0
-    found = False
-    for milestone in sddc.get("milestones") or []:
-        secs = elapsed_seconds(
-            milestone.get("creationTimestamp"),
-            milestone.get("updateTimestamp"),
-        )
-        if secs is not None:
-            total += secs
-            found = True
-    return total if found else None
+    # Collect every creation/update timestamp in the object — top-level,
+    # milestones AND subtasks. On 9.1 a milestone's creationTimestamp is set
+    # when the milestone is *reached*, which can be LATER than its own
+    # subtasks' timestamps; anchoring to the earliest timestamp anywhere avoids
+    # the resulting undercount (the "30 seconds" at task 13/14).
+    starts, ends = [], []
+    if sddc.get("creationTimestamp"):
+        starts.append(sddc["creationTimestamp"])
+    for group in ("milestones", "sddcSubTasks"):
+        for item in sddc.get(group) or []:
+            if item.get("creationTimestamp"):
+                starts.append(item["creationTimestamp"])
+            if item.get("updateTimestamp"):
+                ends.append(item["updateTimestamp"])
+    if not starts:
+        return None
+    start = min(starts)  # ISO-8601 UTC strings sort chronologically
+
+    status = (sddc.get("status") or "").upper()
+    if status in ("COMPLETED_WITH_SUCCESS", "FAILED", "COMPLETED_WITH_FAILURE"):
+        # Terminal: span to the latest recorded update (milestone or subtask).
+        return elapsed_seconds(start, max(ends) if ends else None)
+    # Still in progress: live elapsed from the earliest start (end -> now).
+    return elapsed_seconds(start)
 
 
 # Rich's built-in "dots" spinner drives the in-progress milestone indicator.
@@ -3101,6 +3239,45 @@ _MILESTONE_SPINNER = Spinner("dots")
 def _spinner_frame() -> str:
     """Return the current 'dots' spinner glyph for the wall-clock time."""
     return _MILESTONE_SPINNER.render(time.time()).plain
+
+
+# One visual language for item status across every live display (bundle table,
+# validation checks, deployment milestones). Maps the various API status
+# vocabularies onto a single (glyph, rich-style) pair so success / failure /
+# in-progress / scheduled look identical everywhere. In-progress always uses the
+# animated "dots" spinner — never a static emoji.
+def status_indicator(status: str) -> Tuple[str, str]:
+    """Return ``(glyph, style)`` for an item status string.
+
+    Matches on substrings so prefixed API statuses (e.g.
+    ``POSTVALIDATION_COMPLETED_WITH_SUCCESS``) map correctly. Failure is checked
+    before success so ``COMPLETED_WITH_FAILURE`` resolves to a failure.
+    """
+    s = (status or "").upper()
+    if "FAIL" in s or "ERROR" in s:
+        return "✗", "red"
+    if "SUCCESS" in s or "SUCCEEDED" in s or "COMPLETED" in s:
+        return "✓", "green"
+    if (
+        "IN_PROGRESS" in s
+        or "INPROGRESS" in s
+        or "DOWNLOADING" in s
+        or "VALIDATING" in s
+    ):
+        return _spinner_frame(), "blue"
+    if (
+        "SCHEDULED" in s
+        or "PENDING" in s
+        or "QUEUED" in s
+        or "NOT_STARTED" in s
+        or "INITIALIZED" in s
+    ):
+        return "◌", "cyan"
+    if "SKIPPED" in s:
+        return "⊝", "dim"
+    if "WARNING" in s:
+        return "⚠", "yellow"
+    return "?", "yellow"
 
 
 class LiveDeploymentDisplay:
@@ -3117,6 +3294,21 @@ class LiveDeploymentDisplay:
 
     def __rich_console__(self, console, options):
         yield generate_deployment_status_display(self.sddc)
+
+
+class LiveValidationDisplay:
+    """Dynamic renderable for the validation status display.
+
+    Same idea as LiveDeploymentDisplay: re-invoke the generator on every Live
+    refresh so the in-progress spinner animates fluidly, instead of freezing on
+    a static Text between the (5s-spaced) API polls.
+    """
+
+    def __init__(self, validation: dict = None):
+        self.validation = validation
+
+    def __rich_console__(self, console, options):
+        yield generate_validation_status_display(self.validation)
 
 
 def generate_deployment_status_display(deployment_data: dict = None) -> Text:
@@ -3143,11 +3335,13 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
     # individual time, e.g. "(23 minutes)", or None when unparseable.
     milestone_labels = []
     for milestone in milestones:
-        secs = elapsed_seconds(
-            milestone.get("creationTimestamp"),
-            milestone.get("updateTimestamp"),
-        )
-        if secs is None:
+        creation = milestone.get("creationTimestamp")
+        update = milestone.get("updateTimestamp")
+        secs = elapsed_seconds(creation, update)
+        # Some 9.0.x milestones (vSphere cluster, NSX) report creation==update,
+        # i.e. they were never individually timed (work shows in their
+        # subtasks). Don't render a misleading "(0 seconds)" for those.
+        if secs is None or (creation and update and creation == update):
             milestone_labels.append(None)
             continue
         label = format_seconds(secs)
@@ -3226,18 +3420,7 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
         milestone_status = milestone.get("status", "UNKNOWN")
 
         # Determine color and icon for milestone status
-        if milestone_status == "COMPLETED_WITH_SUCCESS":
-            milestone_color = "green"
-            milestone_icon = "✓"
-        elif milestone_status == "IN_PROGRESS":
-            milestone_color = "blue"
-            milestone_icon = _spinner_frame()
-        elif milestone_status == "FAILED":
-            milestone_color = "red"
-            milestone_icon = "✗"
-        else:
-            milestone_color = "yellow"
-            milestone_icon = "?"
+        milestone_icon, milestone_color = status_indicator(milestone_status)
 
         # Add milestone line with aligned icon
         milestones_text.append("  MILESTONE: ", style="bold cyan")
@@ -3292,19 +3475,8 @@ def generate_deployment_status_display(deployment_data: dict = None) -> Text:
                 subtask_name = subtask.get("name", "Unknown Subtask")
                 subtask_status = subtask.get("status", "UNKNOWN")
 
-                # Determine color and icon for subtask status
-                if subtask_status == "POSTVALIDATION_COMPLETED_WITH_SUCCESS":
-                    subtask_color = "green"
-                    subtask_icon = "✓"
-                elif "IN_PROGRESS" in subtask_status:
-                    subtask_color = "blue"
-                    subtask_icon = "▶"
-                elif "FAILED" in subtask_status:
-                    subtask_color = "red"
-                    subtask_icon = "✗"
-                else:
-                    subtask_color = "yellow"
-                    subtask_icon = "?"
+                # Determine color and icon for subtask status (shared language)
+                subtask_icon, subtask_color = status_indicator(subtask_status)
 
                 milestones_text.append("\n")
                 # Add subtask with aligned icon
