@@ -346,6 +346,66 @@ $ just zcli profile info vcf-902-3hosts -j
 ]
 ```
 
+### Hostname → IP mapping (`.ips.json` sidecar)
+
+Step 4 of the pipeline creates one DNS record per VCF component found in the rendered template. The IP comes from a table that maps each **short hostname** to the **last octet** of the zPod subnet, so `vcsa` in a zPod on `10.43.40.0/26` becomes `10.43.40.10`.
+
+The built-in table covers the hostnames used by the shipped templates:
+
+| Hostname | Octet | | Hostname | Octet |
+|----------|-------|-|----------|-------|
+| `vcfops` | `.3` | | `vcsa` | `.10` |
+| `cloudproxy` / `vcfopscollector` | `.4` | | `nsx` | `.20` |
+| `sddcmgr` | `.5` | | `nsx21` | `.21` |
+| `fleetmgr` | `.6` | | `vcfservicesruntime` / `vcfa` | `.30` |
+| `vcflicense` | `.8` | | `instancecomponents` | `.31` |
+| `identitybroker` | `.9` | | | |
+
+ESXi hosts and the VCF Installer get no record here — zPodFactory already registers those when it provisions the zPod.
+
+**Overriding it.** A template carrying its own naming scheme (or needing a different octet for an existing role) does not require editing the deployer: drop a sidecar next to the template, named after it with `.ips.json` in place of `.json`.
+
+```
+config/vcf91-6h.json       ->  config/vcf91-6h.ips.json
+```
+
+The sidecar is a flat `{"<short hostname>": <last octet>}` object, merged **on top of** the built-in table — so it can rename a role, add one, or move an existing one. Keys starting with `_` are ignored, which gives JSON the comments it lacks:
+
+```json
+{
+  "_comment": "Site addressing plan — Management Domain block -> last octet",
+  "sddcm": 3,
+  "license": 5,
+  "fleetlcm": 6,
+  "vidb": 8,
+  "ops01": 10,
+  "collector01": 20,
+  "nsx": 21,
+  "nsx01": 22,
+  "vcenter": 30,
+  "vsp01": 61,
+  "shared01": 62
+}
+```
+
+A template that ships no sidecar keeps the built-in table byte for byte, so existing configs are unaffected.
+
+**Sidecar lookup follows the template.** The path is derived from the `--vcf-json-template` value, so the sidecar must sit in the same directory as the template actually used. This matters when a wrapper resolves the template by profile name across several directories: put the sidecar next to the winning template, not next to the one it shadowed.
+
+**Validation.** A sidecar that cannot be read or parsed, is not a JSON object, or holds a non-integer or out-of-range octet aborts the run before anything is provisioned. Octets that clash with the zPod's own addressing (`.0` network, `.1` gateway, `.2` zbox/DNS, and the `.50`–`.60` DHCP range) only warn — you stay in control. Octets shared by several hostnames are reported under `--debug`, which is harmless as long as a single template references at most one of them.
+
+**Checking it took effect.** The deployer prints this before phase 1 when a sidecar is loaded:
+
+```
+✓ Hostname/IP sidecar loaded from vcf91-6h.ips.json (11 entries)
+```
+
+And if the template references hostnames nothing maps, step 4 names them rather than silently creating an incomplete DNS configuration that VCF only fails on much later, deep into validation:
+
+```
+⚠️ No IP mapping for collector01, fleetlcm, ops01, sddcm, vcenter — no DNS record created for them
+   Add the missing name(s) to a '<template>.ips.json' file next to the VCF JSON template.
+```
 
 ## Deployment Pipeline
 
@@ -354,7 +414,7 @@ When you run the deployer, it executes these steps in order:
 1. **Provision zPod** — Creates a new zPod via the zPodFactory API and waits for it to become active
 2. **Render VCF config** — Processes the Jinja2 template with zPod-specific variables (network, domain, passwords)
 3. **Prepare ESXi hosts** *(VCF 9.1 only)* — Installs the [nested vSAN ESA mock-HW VIB](https://github.com/lamw/nested-vsan-esa-mock-hw-vib) on each ESXi host over SSH, since VCF 9.1 enables vSAN ESA on nested hardware. Idempotent — skips hosts that already have the VIB.
-4. **Configure DNS** — Creates DNS records for all VCF components (vCenter, NSX, ESXi hosts, SDDC Manager)
+4. **Configure DNS** — Creates DNS records for all VCF components (vCenter, NSX, SDDC Manager…), from the [hostname → IP mapping](#hostname--ip-mapping-ipsjson-sidecar) a template can override with a `.ips.json` sidecar
 5. **Set up VCF depot** — Configures the online or offline depot on the VCF installer
 6. **Download bundles** — Downloads required VCF bundles (ESXi, vCenter, NSX-T, etc.)
 7. **Validate SDDC** — Runs VCF validation checks on the SDDC spec with live status tracking
