@@ -1012,6 +1012,12 @@ async def _deploy_entry(
     # Parse VCF JSON template
     vcf_template_data = json.loads(vcf_json_template.read())
 
+    # Resolve the hostname -> IP octet mapping. Honours an optional
+    # "<template>.ips.json" sidecar; falls back to the built-in table.
+    hostname_ip_mapping = load_hostname_ip_mapping(
+        getattr(vcf_json_template, "name", None)
+    )
+
     # The template's top-level "version" key is the single source of truth for
     # the release version that drives the depot/release-component API calls.
     vcf_version = str(vcf_template_data.get("version", "")).strip()
@@ -1117,7 +1123,7 @@ async def _deploy_entry(
             )
 
         phase_banner(4, "Configuring DNS records")
-        configure_dns(zpod_client, zpod_name, vcf_json)
+        configure_dns(zpod_client, zpod_name, vcf_json, hostname_ip_mapping)
 
         phase_banner(5, "Downloading VCF bundles")
         await configure_vcf_depot_and_bundles(
@@ -1467,6 +1473,107 @@ HOSTNAME_IP_MAPPING = {
     "vcfa": "30",
 }
 
+# Optional per-template override of HOSTNAME_IP_MAPPING.
+#
+# A template may ship a sidecar file next to it, named after the template with
+# ".ips.json" appended in place of its extension:
+#
+#   config/v9.1.0.0_std_3hosts.json -> config/v9.1.0.0_std_3hosts.ips.json
+#
+# The sidecar is a flat {"<short hostname>": <last octet>} object, merged on top
+# of HOSTNAME_IP_MAPPING. It can rename a role (point a new short name at the
+# octet a built-in name already uses) or add one. Templates that ship no sidecar
+# keep the built-in mapping byte for byte, so existing configs are unaffected.
+HOSTNAME_IP_MAPPING_SIDECAR_SUFFIX = ".ips.json"
+
+# Octets that must not be handed to a VCF appliance: .0 network, .1 zPod
+# gateway, .2 zbox (DNS), and the .50-.60 DHCP range. Used for warnings only —
+# the sidecar author stays in control.
+_RESERVED_OCTETS = {0, 1, 2} | set(range(50, 61))
+
+
+def load_hostname_ip_mapping(template_path) -> dict:
+    """Return HOSTNAME_IP_MAPPING, merged with the template's sidecar if any.
+
+    Args:
+        template_path: Path of the VCF JSON template (str or Path). A falsy
+            value returns the built-in mapping unchanged.
+
+    Returns:
+        dict: short hostname -> last octet (as str, like the built-in table).
+    """
+    mapping = dict(HOSTNAME_IP_MAPPING)
+
+    if not template_path:
+        return mapping
+
+    sidecar = Path(template_path).with_suffix(HOSTNAME_IP_MAPPING_SIDECAR_SUFFIX)
+    if not sidecar.is_file():
+        debug_console.print(
+            f"[dim]No hostname/IP sidecar at {sidecar} — using built-in mapping[/dim]"
+        )
+        return mapping
+
+    try:
+        overrides = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        console.print(f"[bold red]❌ Cannot read {sidecar}: {e}[/bold red]")
+        raise typer.Exit(code=1)
+
+    if not isinstance(overrides, dict):
+        console.print(
+            f"[bold red]❌ {sidecar} must be a JSON object of "
+            f'{{"hostname": octet}} pairs[/bold red]'
+        )
+        raise typer.Exit(code=1)
+
+    for hostname, octet in overrides.items():
+        # Keys starting with "_" are comments — JSON has none of its own.
+        if hostname.startswith("_"):
+            continue
+
+        try:
+            octet_int = int(octet)
+        except (TypeError, ValueError):
+            console.print(
+                f"[bold red]❌ {sidecar}: octet for '{hostname}' is not an "
+                f"integer ({octet!r})[/bold red]"
+            )
+            raise typer.Exit(code=1)
+
+        if not 0 <= octet_int <= 255:
+            console.print(
+                f"[bold red]❌ {sidecar}: octet for '{hostname}' is out of "
+                f"range ({octet_int})[/bold red]"
+            )
+            raise typer.Exit(code=1)
+
+        if octet_int in _RESERVED_OCTETS:
+            console.print(
+                f"[yellow]⚠️ {sidecar}: '{hostname}' uses reserved octet "
+                f"{octet_int} (gateway / zbox / DHCP range)[/yellow]"
+            )
+
+        mapping[hostname] = str(octet_int)
+
+    # Two hostnames on one octet means one DNS record silently wins.
+    by_octet = {}
+    for hostname, octet in mapping.items():
+        by_octet.setdefault(octet, []).append(hostname)
+    for octet, hostnames in sorted(by_octet.items(), key=lambda kv: int(kv[0])):
+        if len(hostnames) > 1:
+            debug_console.print(
+                f"[dim]Octet .{octet} shared by {', '.join(sorted(hostnames))} "
+                f"— fine only if a template references at most one[/dim]"
+            )
+
+    entries = sum(1 for k in overrides if not k.startswith("_"))
+    console.print(
+        f"[green]✓ Hostname/IP sidecar loaded from {sidecar.name} "
+        f"({entries} entries)[/green]"
+    )
+    return mapping
+
 # VCF JSON spec key -> depot/release component name(s). A spec key only
 # contributes its components when that key is present in the rendered template.
 # This single table serves both versions: 9.1 split VCF Operations and its
@@ -1712,8 +1819,16 @@ def configure_dns(
     zpod_client: httpx.Client,
     zpod_name: str,
     vcf_json: dict,
+    hostname_ip_mapping: "dict | None" = None,
 ):
-    """Configure DNS records for the zPod"""
+    """Configure DNS records for the zPod
+
+    Args:
+        hostname_ip_mapping: short hostname -> last octet. Defaults to the
+            built-in HOSTNAME_IP_MAPPING when omitted, so callers that do not
+            use a template sidecar behave exactly as before.
+    """
+    mapping = hostname_ip_mapping or HOSTNAME_IP_MAPPING
     console.print("[bold cyan]🌐 Configuring DNS records...[/bold cyan]")
 
     def find_hostnames_in_json(obj, hostnames=None):
@@ -1741,24 +1856,25 @@ def configure_dns(
 
         return hostnames
 
+    # Hostnames the template references but the mapping does not cover, minus
+    # the ones that deliberately get no record here (see below). Reported after
+    # the loop: a template using its own short names with no matching sidecar
+    # would otherwise leave DNS almost empty without saying so.
+    unmapped = []
+
     def get_ip_for_hostname(hostname, zpod_subnet):
         """Get IP address for hostname using correspondence table"""
         hostname_part = hostname.split(".")[0]
 
-        if hostname_part in HOSTNAME_IP_MAPPING:
-            ip_suffix = HOSTNAME_IP_MAPPING[hostname_part]
+        if hostname_part in mapping:
+            ip_suffix = mapping[hostname_part]
             ip_address = f"{zpod_subnet}.{ip_suffix}"
             return ip_address, hostname_part
 
-        # ESXi hosts and the VCF Installer intentionally get no DNS record here;
-        # any other unmapped hostname is likely a template/mapping mismatch.
-        if global_debug and not (
-            hostname_part.startswith("esxi") or hostname_part == "vcfinstaller"
-        ):
-            debug_console.print(
-                f"[yellow]⚠️ No IP mapping for hostname '{hostname_part}' "
-                f"({hostname}) — skipping DNS record[/yellow]"
-            )
+        # ESXi hosts and the VCF Installer intentionally get no DNS record here:
+        # zPodFactory already registers them when it provisions the zPod.
+        if not (hostname_part.startswith("esxi") or hostname_part == "vcfinstaller"):
+            unmapped.append(hostname_part)
         return None, hostname
 
     # Get the zpod subnet from the VCF JSON
@@ -1789,6 +1905,22 @@ def configure_dns(
         ip_address, resolved_hostname = get_ip_for_hostname(hostname, zpod_subnet)
         if ip_address:
             resolved_records.append((ip_address, resolved_hostname))
+
+    # A hostname the template uses but nothing maps gets no DNS record, and VCF
+    # only fails on it much later, deep into validation. Say so now, and point
+    # at the sidecar that fixes it — this is exactly what a template carrying
+    # its own naming scheme hits when its sidecar is missing or misplaced.
+    if unmapped:
+        console.print(
+            f"[yellow]⚠️ No IP mapping for {', '.join(sorted(set(unmapped)))} "
+            f"— no DNS record created for "
+            f"{'them' if len(set(unmapped)) > 1 else 'it'}[/yellow]"
+        )
+        console.print(
+            f"[yellow]   Add the missing name(s) to a "
+            f"'<template>{HOSTNAME_IP_MAPPING_SIDECAR_SUFFIX}' file next to the "
+            f"VCF JSON template.[/yellow]"
+        )
 
     if not resolved_records:
         console.print("[yellow]No hostnames found to configure.[/yellow]")
