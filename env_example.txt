@@ -30,3 +30,9 @@ VCF_OFFLINE_DEPOT_PORT=443
 # VCF Configuration (optional, has defaults)
 VCF_SKU=VCF
 VCF_VERSION=9.0.2.0
+
+# Nested NSX VDR MAC (optional, has default)
+# Fixes an L3-routing MAC collision between the nested NSX-T deployed inside
+# the zPod and zPodFactory's outer/physical NSX-T, which both default to the
+# same VDR MAC address. See docs/nsx-nested-mac-fix.md for details.
+NESTED_NSX_VDR_MAC=02:50:56:42:42:42

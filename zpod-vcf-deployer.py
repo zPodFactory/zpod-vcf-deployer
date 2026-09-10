@@ -6,7 +6,9 @@
 import asyncio
 import json
 import math
+import re
 import signal
+import socket
 import sys
 import time
 from datetime import datetime, timezone
@@ -275,6 +277,17 @@ def main(
             envvar="VCF_OFFLINE_DEPOT_PORT",
         ),
     ] = 443,
+    nested_nsx_vdr_mac: Annotated[
+        str,
+        typer.Option(
+            "--nested-nsx-vdr-mac",
+            help="Target VDR MAC address to set on the nested NSX Manager, "
+            "to avoid an L3-routing MAC collision with zPodFactory's outer "
+            "NSX-T layer once the nested hosts are NSX-prepared. See "
+            "docs/nsx-nested-mac-fix.md.",
+            envvar="NESTED_NSX_VDR_MAC",
+        ),
+    ] = "02:50:56:42:42:42",
     verify_only: bool = typer.Option(
         False,
         "--verify-only",
@@ -373,6 +386,7 @@ def main(
                 offline_depot_username=offline_depot_username,
                 offline_depot_password=offline_depot_password,
                 offline_depot_port=offline_depot_port,
+                nested_nsx_vdr_mac=nested_nsx_vdr_mac,
                 verify_only=verify_only,
             )
         )
@@ -980,6 +994,7 @@ async def _deploy_entry(
     offline_depot_username: str = None,
     offline_depot_password: str = None,
     offline_depot_port: int = 443,
+    nested_nsx_vdr_mac: str = "02:50:56:42:42:42",
     verify_only: bool = False,
 ):
     """
@@ -998,6 +1013,9 @@ async def _deploy_entry(
         offline_depot_username (str, optional): Offline depot username
         offline_depot_password (str, optional): Offline depot password
         offline_depot_port (int, optional): Offline depot port (default: 443)
+        nested_nsx_vdr_mac (str, optional): Target VDR MAC address for the
+            nested NSX Manager, to avoid an L3-routing MAC collision with
+            zPodFactory's outer NSX-T layer (default: "02:50:56:42:42:42")
         verify_only (bool, optional): Stop after SDDC validation, before
             deployment (default: False)
 
@@ -1156,7 +1174,9 @@ async def _deploy_entry(
             await _run_sddc_operations(
                 vcf_client,
                 vcf_json,
+                zpod,
                 "Starting fresh validation and deployment",
+                nested_nsx_vdr_mac=nested_nsx_vdr_mac,
                 verify_only=verify_only,
             )
             return
@@ -1189,6 +1209,8 @@ async def _deploy_entry(
             await initiate_sddc_deployment(
                 client=vcf_client,
                 vcf_json=vcf_json,
+                zpod=zpod,
+                nested_nsx_vdr_mac=nested_nsx_vdr_mac,
             )
             return
 
@@ -1238,7 +1260,9 @@ async def _deploy_entry(
         await initiate_sddc_deployment(
             client=vcf_client,
             vcf_json=vcf_json,
+            zpod=zpod,
             sddc_id=detected_sddc_id,
+            nested_nsx_vdr_mac=nested_nsx_vdr_mac,
         )
 
         console.print("[bold green]✅ Deployment completed successfully![/bold green]")
@@ -1317,7 +1341,12 @@ def _print_verify_only_stop():
 
 
 async def _run_sddc_operations(
-    client: VCFClient, vcf_json: dict, message: str, verify_only: bool = False
+    client: VCFClient,
+    vcf_json: dict,
+    zpod: dict,
+    message: str,
+    nested_nsx_vdr_mac: str = "02:50:56:42:42:42",
+    verify_only: bool = False,
 ):
     """
     Helper function to run SDDC validation and deployment operations.
@@ -1325,7 +1354,10 @@ async def _run_sddc_operations(
     Args:
         client: VCF client instance
         vcf_json: VCF template JSON
+        zpod: zPod information (domain, password) — passed through to
+            initiate_sddc_deployment() for the NSX VDR MAC collision fix
         message: Message to display before starting operations
+        nested_nsx_vdr_mac: Target VDR MAC for the nested NSX Manager
         verify_only: When True, stop after validation without deploying
     """
     debug_console.print(
@@ -1343,6 +1375,8 @@ async def _run_sddc_operations(
     await initiate_sddc_deployment(
         client=client,
         vcf_json=vcf_json,
+        zpod=zpod,
+        nested_nsx_vdr_mac=nested_nsx_vdr_mac,
     )
 
 
@@ -1815,6 +1849,397 @@ async def install_vsan_esa_mock_vib(vcf_json: dict, zpod: dict):
         raise typer.Exit(code=1)
 
 
+# --- Nested NSX-T VDR MAC collision fix -------------------------------------
+#
+# The nested NSX-T deployed inside the zPod and zPodFactory's own outer/
+# physical NSX-T both default their virtual distributed router (VDR) MAC to
+# the same hardcoded value. Once NSX-T prepares the nested ESXi hosts, this
+# collides with the outer layer's own T1/T0 downlink MAC, breaking L3/T1-
+# routed traffic between "outside the zpod" and hosts inside it (L2 keeps
+# working). See docs/nsx-nested-mac-fix.md for the full writeup.
+#
+# The script's own network path to nsx.{domain} crosses the same outer T1
+# boundary this bug breaks, so it can't be trusted to make the fix API call
+# directly. zcore (zpodfactory's always-present ".2" host) sits on the same
+# L2 segment as the nested NSX Manager and stays reachable regardless — all
+# NSX Policy API calls run from there over SSH. Only the verification pings
+# run from the script's own location, since that's the only vantage point
+# that actually exercises the path the bug breaks.
+
+NSX_GLOBAL_CONFIG_PATH = "/policy/api/v1/infra/global-config"
+
+
+def _get_management_subnet(vcf_json: dict) -> Optional[str]:
+    """First three octets of the VCF management network's subnet, e.g.
+    '172.16.50' from '172.16.50.0/24'. Same derivation configure_dns() uses
+    for its hostname -> IP mapping; used here to reach zcore by IP, since it
+    has no DNS hostname of its own (it's reserved, not part of
+    HOSTNAME_IP_MAPPING — zPodFactory manages that record, not this script).
+    """
+    for network_spec in vcf_json.get("networkSpecs", []):
+        if network_spec.get("networkType") == "MANAGEMENT":
+            subnet = network_spec.get("subnet", "")
+            if subnet:
+                parts = subnet.split(".")
+                if len(parts) >= 3:
+                    return f"{parts[0]}.{parts[1]}.{parts[2]}"
+    return None
+
+
+_PING_AVG_RTT_RE = re.compile(r"=\s*[\d.]+/([\d.]+)/[\d.]+")
+
+
+async def _ping(
+    hostname: str, attempts: int = 4, delay: int = 5, count: int = 4, timeout: int = 2
+) -> Optional[float]:
+    """Ping hostname `count` times per attempt (a real `ping -c {count}`,
+    proof this is genuine ICMP traffic, not just a checkmark), retrying up
+    to `attempts` attempts with `delay`s between if the host doesn't reply
+    at all. Returns the average round-trip time in milliseconds across the
+    `count` probes on the first attempt that gets at least one reply
+    (parsed from ping's own `rtt min/avg/max/mdev` summary line), or None
+    if every attempt gets zero replies.
+
+    Always run this from the script's own location, never from zcore — its
+    entire purpose is to exercise the script -> outer-router -> zpod-subnet
+    path the nested VDR MAC collision breaks. Pinging from zcore (same L2
+    segment as the target) would never cross that boundary and would prove
+    nothing.
+    """
+    for attempt in range(1, attempts + 1):
+        proc = await asyncio.create_subprocess_exec(
+            "ping",
+            "-c",
+            str(count),
+            "-W",
+            str(timeout),
+            hostname,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            match = _PING_AVG_RTT_RE.search(stdout.decode(errors="ignore"))
+            if match:
+                return float(match.group(1))
+        if global_debug:
+            debug_console.print(
+                f"[dim]ping {hostname}: attempt {attempt}/{attempts} — no "
+                f"replies from {count} probes[/dim]"
+            )
+        if attempt < attempts:
+            await asyncio.sleep(delay)
+    return None
+
+
+async def _nsx_curl_via_zcore(
+    conn,
+    nsx_hostname: str,
+    nsx_password: str,
+    method: str,
+    body: Optional[dict] = None,
+) -> Optional[dict]:
+    """Run one curl call against https://{nsx_hostname}{NSX_GLOBAL_CONFIG_PATH}
+    over an already-open SSH session to zcore — never a direct HTTP call
+    from the script itself. GET: returns the parsed JSON response, or None
+    on failure/not-ready. PUT: `body` is passed via the remote command's
+    stdin (conn.run(..., input=...)) rather than embedded in the command
+    string, to avoid shell-escaping a JSON payload.
+    """
+    url = f"https://{nsx_hostname}{NSX_GLOBAL_CONFIG_PATH}"
+    if method == "GET":
+        cmd = f"curl -sk -u admin:{nsx_password} {url}"
+        input_data = None
+    else:
+        cmd = (
+            f"curl -sk -u admin:{nsx_password} -X PUT "
+            f"-H 'Content-Type: application/json' -d @- {url}"
+        )
+        input_data = json.dumps(body)
+
+    result = await conn.run(cmd, input=input_data, check=False, timeout=30)
+    if result.exit_status != 0 or not result.stdout:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+async def _set_nsx_vdr_mac(conn, zpod: dict, mac: str) -> Tuple[str, str]:
+    """GET/PUT the nested NSX Manager's global VDR MAC via curl over an
+    already-open SSH session to zcore. Applied unconditionally — never
+    gated on ping status, since the fix is meant to prevent the collision
+    from manifesting at all, not just react to it. Always logs the
+    before/after value, including the no-op case. Returns (old_mac, new_mac).
+
+    Raises RuntimeError if the NSX Manager API isn't reachable/ready yet —
+    callers decide their own retry policy around that.
+    """
+    nsx_hostname = f"nsx.{zpod['domain']}"
+    password = zpod.get("password", "")
+
+    config = await _nsx_curl_via_zcore(conn, nsx_hostname, password, "GET")
+    if config is None or "vdr_mac" not in config:
+        raise RuntimeError(f"NSX Manager API not ready yet on {nsx_hostname}")
+
+    old_mac = config["vdr_mac"]
+    if old_mac.lower() == mac.lower():
+        console.print(
+            f"[dim]NSX VDR MAC on {nsx_hostname} already {mac} (no change)[/dim]"
+        )
+        return old_mac, mac
+
+    config["vdr_mac"] = mac
+    config["allow_changing_vdr_mac_in_use"] = True
+    result = await _nsx_curl_via_zcore(
+        conn, nsx_hostname, password, "PUT", body=config
+    )
+    if result is None:
+        raise RuntimeError(f"Failed to set NSX VDR MAC on {nsx_hostname}")
+
+    console.print(f"[cyan]🔧 NSX VDR MAC on {nsx_hostname}: {old_mac} → {mac}[/cyan]")
+    return old_mac, mac
+
+
+async def _connect_zcore_ssh(zpod: dict, vcf_json: dict):
+    """Open an SSH session to zcore (zpodfactory's always-present '.2' host)
+    as root. zcore is the one host inside the zpod that stays reachable from
+    the script regardless of the nested VDR MAC collision, since it's on the
+    same L2 segment as the nested NSX Manager rather than reached through the
+    outer T1 router. All NSX Manager Policy API calls are made from here.
+    """
+    import asyncssh  # lazy import, matches _install_vib_on_host's pattern
+
+    zpod_subnet = _get_management_subnet(vcf_json)
+    if not zpod_subnet:
+        raise RuntimeError("Could not determine zpod management subnet for zcore")
+    zcore_ip = f"{zpod_subnet}.2"
+
+    return await asyncssh.connect(
+        zcore_ip,
+        username="root",
+        password=zpod.get("password", ""),
+        known_hosts=None,  # zcore's SSH identity is ephemeral per zpod
+        login_timeout=30,
+    )
+
+
+async def _wait_and_fix_nsx_vdr_mac(zpod: dict, vcf_json: dict, mac: str):
+    """Background task, spawned lazily by initiate_sddc_deployment()'s
+    existing monitor loop the first time it observes the 'Deploy and
+    configure NSX' milestone leave NOT_STARTED. Applies the nested NSX
+    Manager's VDR MAC fix proactively, before host prep can expose the
+    collision, then verifies live via a ping from the script itself.
+    """
+    try:
+        conn = await _connect_zcore_ssh(zpod, vcf_json)
+    except Exception as e:
+        console.print(
+            f"[yellow]⚠️ NSX MAC fix: could not SSH to zcore: {e}[/yellow]"
+        )
+        return
+
+    try:
+        while True:
+            try:
+                await _set_nsx_vdr_mac(conn, zpod, mac)
+                break
+            except RuntimeError as e:
+                if global_debug:
+                    debug_console.print(
+                        f"[dim]NSX MAC fix: {e}, retrying...[/dim]"
+                    )
+                await asyncio.sleep(10)
+    finally:
+        conn.close()
+
+    vcsa_hostname = f"vcsa.{zpod['domain']}"
+    with console.status(f"  Testing [cyan]{vcsa_hostname}[/cyan]..."):
+        elapsed_ms = await _ping(vcsa_hostname, attempts=4, delay=5)
+    if elapsed_ms is not None:
+        console.print(
+            f"[green]✓[/green] {vcsa_hostname} reachable after NSX VDR MAC "
+            f"fix ({elapsed_ms:.1f}ms)"
+        )
+    else:
+        console.print(
+            f"[yellow]⚠️ {vcsa_hostname} still unreachable after NSX VDR MAC "
+            f"fix — will re-check at end of deploy[/yellow]"
+        )
+
+
+async def _cancel_nsx_fix_task(task):
+    """Cancel and await the background NSX MAC fix task, swallowing the
+    resulting CancelledError. No-op if the task is None or already done."""
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass  # already logged inside the task itself
+
+
+async def _run_nsx_mac_diagnostic(zpod: dict, vcf_json: dict, mac: str):
+    """End-of-deploy safety net: re-applies the NSX VDR MAC fix (idempotent —
+    covers the case where the background task above never got a chance to
+    run) and prints a ping summary. Never fails the deploy — the SDDC has
+    already completed successfully by the time this runs.
+    """
+    console.print("[bold cyan]🔍 Verifying nested NSX VDR MAC...[/bold cyan]")
+
+    try:
+        conn = await _connect_zcore_ssh(zpod, vcf_json)
+        try:
+            for attempt in range(3):
+                try:
+                    await _set_nsx_vdr_mac(conn, zpod, mac)
+                    break
+                except RuntimeError as e:
+                    if attempt == 2:
+                        console.print(
+                            f"[yellow]⚠️ NSX MAC fix: {e} (giving up after "
+                            f"3 attempts)[/yellow]"
+                        )
+                    else:
+                        await asyncio.sleep(10)
+        finally:
+            conn.close()
+    except Exception as e:
+        console.print(
+            f"[yellow]⚠️ NSX MAC fix: could not SSH to zcore: {e}[/yellow]"
+        )
+
+    await _run_connectivity_summary(vcf_json)
+
+
+async def _ping_hosts_concurrently(
+    targets: List[Tuple[str, str]],
+) -> Dict[str, Optional[float]]:
+    """Ping every (hostname, label) pair in `targets` concurrently — one
+    slow/unreachable host has no reason to block the rest, they're
+    independent checks. Live-renders one spinner/result line per host (same
+    visual result as testing them one at a time: "Testing X..." while
+    pending, "✓ X — Nms" / "✗ X" once done) while the pings actually run in
+    parallel underneath. Returns {hostname: avg_rtt_ms_or_None}.
+    """
+    tasks = {
+        hostname: asyncio.create_task(_ping(hostname, attempts=4, delay=5))
+        for hostname, _ in targets
+    }
+
+    def render() -> str:
+        lines = []
+        for hostname, label in targets:
+            task = tasks[hostname]
+            if task.done():
+                result = task.result()
+                if result is not None:
+                    lines.append(f"  [green]✓[/green] {label} — {result:.1f}ms")
+                else:
+                    lines.append(f"  [red]✗[/red] {label}")
+            else:
+                lines.append(f"  {_spinner_frame()} Testing {label}...")
+        return "\n".join(lines)
+
+    with Live(render(), refresh_per_second=12.5, console=console) as live:
+        while not all(t.done() for t in tasks.values()):
+            await asyncio.sleep(1 / 12.5)
+            live.update(render())
+        live.update(render())
+
+    return {hostname: tasks[hostname].result() for hostname, _ in targets}
+
+
+async def _run_connectivity_summary(vcf_json: dict):
+    """Ping every VCF component FQDN found in the rendered template and
+    print a pass/fail summary — generic across templates rather than a
+    fixed hardcoded subset. Runs once at the end of a successful deploy, as
+    a general health check (by that point the NSX VDR MAC fix has already
+    been applied, so a component still being unreachable here is worth a
+    human look regardless of cause). All hosts are pinged concurrently —
+    they're independent checks, no reason to serialize them.
+    """
+    console.print(
+        "\n[bold cyan]Verifying VCF components connectivity...[/bold cyan]"
+    )
+
+    hostnames = sorted(set(_find_component_hostnames(vcf_json)))
+    if not hostnames:
+        console.print(
+            "[yellow]⚠️ No component hostnames found in the VCF template[/yellow]"
+        )
+        console.print()
+        return
+
+    targets = []
+    for hostname in hostnames:
+        try:
+            ip = socket.gethostbyname(hostname)
+            label = f"{hostname} ({ip})"
+        except socket.gaierror:
+            label = hostname
+        targets.append((hostname, label))
+
+    results = await _ping_hosts_concurrently(targets)
+    failures = [hostname for hostname, ms in results.items() if ms is None]
+
+    if failures:
+        console.print(
+            f"[yellow]⚠️ {len(failures)} component(s) still unreachable: "
+            f"{', '.join(failures)}[/yellow]"
+        )
+
+    console.print()
+
+
+def _nsx_milestone_started(sddc: dict, milestone_name: str) -> bool:
+    """True if the named milestone in sddc['milestones'] has left
+    NOT_STARTED (i.e. status is anything else, including already completed).
+    Used to gate the background MAC-fix task rather than relying on subtask
+    names, which differ across VCF versions — see
+    docs/nsx-nested-mac-fix.md."""
+    for milestone in sddc.get("milestones") or []:
+        if milestone.get("name") == milestone_name:
+            return milestone.get("status") != "NOT_STARTED"
+    return False
+
+
+# --- end nested NSX-T VDR MAC collision fix ---------------------------------
+
+
+def _find_component_hostnames(vcf_json, hostnames=None):
+    """Recursively find every already-rendered component FQDN referenced in
+    the VCF template JSON (hostname / vcenterHostname / vipFqdn /
+    platformFqdn / instanceFqdn / fleetFqdn keys). Shared by configure_dns()
+    (to create DNS records) and the end-of-deploy connectivity summary (to
+    ping every real VCF component rather than a fixed hardcoded subset)."""
+    if hostnames is None:
+        hostnames = []
+
+    if isinstance(vcf_json, dict):
+        for key, value in vcf_json.items():
+            if key in [
+                "hostname",
+                "vcenterHostname",
+                "vipFqdn",
+                "platformFqdn",
+                "instanceFqdn",
+                "fleetFqdn",
+            ] and isinstance(value, str):
+                if "." in value and not value.startswith("{{"):
+                    hostnames.append(value)
+            else:
+                _find_component_hostnames(value, hostnames)
+    elif isinstance(vcf_json, list):
+        for item in vcf_json:
+            _find_component_hostnames(item, hostnames)
+
+    return hostnames
+
+
 def configure_dns(
     zpod_client: httpx.Client,
     zpod_name: str,
@@ -1830,31 +2255,6 @@ def configure_dns(
     """
     mapping = hostname_ip_mapping or HOSTNAME_IP_MAPPING
     console.print("[bold cyan]🌐 Configuring DNS records...[/bold cyan]")
-
-    def find_hostnames_in_json(obj, hostnames=None):
-        """Recursively find all hostnames in JSON structure that contain the domain"""
-        if hostnames is None:
-            hostnames = []
-
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key in [
-                    "hostname",
-                    "vcenterHostname",
-                    "vipFqdn",
-                    "platformFqdn",
-                    "instanceFqdn",
-                    "fleetFqdn",
-                ] and isinstance(value, str):
-                    if "." in value and not value.startswith("{{"):
-                        hostnames.append(value)
-                else:
-                    find_hostnames_in_json(value, hostnames)
-        elif isinstance(obj, list):
-            for item in obj:
-                find_hostnames_in_json(item, hostnames)
-
-        return hostnames
 
     # Hostnames the template references but the mapping does not cover, minus
     # the ones that deliberately get no record here (see below). Reported after
@@ -1897,7 +2297,7 @@ def configure_dns(
         return
 
     # Find all hostnames in the JSON structure
-    hostnames = find_hostnames_in_json(vcf_json)
+    hostnames = _find_component_hostnames(vcf_json)
 
     # Get IP addresses for all hostnames using correspondence table
     resolved_records = []
@@ -2960,7 +3360,9 @@ async def initiate_sddc_validations(
 async def initiate_sddc_deployment(
     client: VCFClient,
     vcf_json: dict,
+    zpod: dict,
     sddc_id: str = None,
+    nested_nsx_vdr_mac: str = "02:50:56:42:42:42",
 ):
     """
     Initiate and monitor SDDC deployment with live visual display.
@@ -2968,7 +3370,11 @@ async def initiate_sddc_deployment(
     Args:
         client (VCFClient): VCF API client for API calls
         vcf_json (dict): VCF configuration JSON
+        zpod (dict): zPod information (domain, password) — used to reach
+            zcore and the nested NSX Manager for the VDR MAC collision fix
         sddc_id (str, optional): Existing SDDC ID to monitor
+        nested_nsx_vdr_mac (str, optional): Target VDR MAC for the nested
+            NSX Manager (default: "02:50:56:42:42:42")
 
     Raises:
         typer.Exit: On deployment failures or errors
@@ -2976,6 +3382,11 @@ async def initiate_sddc_deployment(
     global monitoring_active, final_deployment_seconds, sddc_end_iso
 
     phase_banner(7, "Deploying SDDC")
+
+    # Background NSX VDR MAC fix task — spawned lazily below, the first time
+    # the monitor loop observes the "Deploy and configure NSX" milestone
+    # leave NOT_STARTED. See docs/nsx-nested-mac-fix.md.
+    nsx_fix_task = None
 
     # Create new deployment if no sddc_id provided
     if not sddc_id:
@@ -3067,6 +3478,19 @@ async def initiate_sddc_deployment(
                             await asyncio.sleep(5)
                             continue
 
+                        # Spawn the NSX VDR MAC fix task exactly once, the
+                        # first time this loop observes the NSX milestone
+                        # leave NOT_STARTED. Reuses the sddc payload already
+                        # fetched above — no separate/redundant polling.
+                        if nsx_fix_task is None and _nsx_milestone_started(
+                            sddc, "Deploy and configure NSX"
+                        ):
+                            nsx_fix_task = asyncio.create_task(
+                                _wait_and_fix_nsx_vdr_mac(
+                                    zpod, vcf_json, nested_nsx_vdr_mac
+                                )
+                            )
+
                         sddc_status = sddc["status"]
                         if sddc_status != "IN_PROGRESS":
                             # Terminal state — record the real (milestone-
@@ -3111,11 +3535,13 @@ async def initiate_sddc_deployment(
                 "\n\n⚠️ [yellow]Deployment monitoring interrupted by user (Ctrl+C)[/yellow]"
             )
             console.print("🔄 [blue]Stopping deployment monitoring...[/blue]")
+            await _cancel_nsx_fix_task(nsx_fix_task)
             return
         except Exception as e:
             if live:
                 live.stop()
             console.print(f"\n❌ [red]Error in deployment monitoring: {e}[/red]")
+            await _cancel_nsx_fix_task(nsx_fix_task)
             raise typer.Exit(code=1)
         finally:
             # Guarantee cleanup: stop() is a no-op if not started / already
@@ -3129,6 +3555,12 @@ async def initiate_sddc_deployment(
             console.print(
                 "\n[bold green]✅ SDDC deployment completed successfully![/bold green]"
             )
+            # The background task rarely gets a real chance to run when we
+            # attach to an already-complete deployment (this branch is hit
+            # on the very first poll) — the safety net below is what does
+            # the real work in that case. Await/cancel it first either way.
+            await _cancel_nsx_fix_task(nsx_fix_task)
+            await _run_nsx_mac_diagnostic(zpod, vcf_json, nested_nsx_vdr_mac)
             return
 
         if sddc_status == "COMPLETED_WITH_FAILURE":
@@ -3139,6 +3571,7 @@ async def initiate_sddc_deployment(
                 )
                 # Full payload already dumped to the debug log on the
                 # terminal-state break above.
+                await _cancel_nsx_fix_task(nsx_fix_task)
                 raise typer.Exit(code=1)
 
             resume_attempt += 1
@@ -3178,9 +3611,11 @@ async def initiate_sddc_deployment(
             console.print("\n[bold red]❌ SDDC deployment failed[/bold red]")
             # Full payload already dumped to the debug log on the
             # terminal-state break above.
+            await _cancel_nsx_fix_task(nsx_fix_task)
             raise typer.Exit(code=1)
 
         console.print(f"\n[bold red]❌ Unexpected status: {sddc_status}[/bold red]")
+        await _cancel_nsx_fix_task(nsx_fix_task)
         raise typer.Exit(code=1)
 
 
