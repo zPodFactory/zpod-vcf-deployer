@@ -420,6 +420,16 @@ When you run the deployer, it executes these steps in order:
 7. **Validate SDDC** — Runs VCF validation checks on the SDDC spec with live status tracking
 8. **Deploy SDDC** — Deploys the SDDC with real-time milestone progress display
 
+### vSAN ESA and `failuresToTolerate` (VCF 9.1+)
+
+vSAN ESA ignores `datastoreSpec.vsanSpec.failuresToTolerate`. Its auto-policy management creates a `<cluster> - Optimal Datastore Default Policy - AutoRAID` policy, makes it the datastore default and picks the RAID level from the host count (RAID-1 under 5 hosts, then RAID-5/6) — so every appliance the installer deploys lands on RAID-1/5 instead of the FTT=0 a nested lab asked for, and there is no installer-spec field to opt out.
+
+When (and only when) a template enables `esaConfig` **and** sets `failuresToTolerate: 0`, the deployer applies the workaround itself against vCenter: it disables auto-policy management and AutoRAID, creates a `zPod vSAN ESA - No data redundancy (FTT=0)` storage policy, makes it the datastore default, and re-applies it to the VM home and disks of the management VMs. It runs in the background as soon as vCenter answers — so NSX, VCF Operations and SDDC Manager are deployed straight onto FTT=0 — and again as a sweep at the end of the deploy. Both passes are idempotent, and a failure is reported as a warning without failing the deployment.
+
+A template asking for `failuresToTolerate: 1` is left alone, on vSAN's own behaviour.
+
+> **FTT=0 is a lab-only setting.** Losing a host or a disk loses the management VMs, and SDDC Manager may flag compliance alerts. Use FTT=1 or higher for anything you care about.
+
 Each step is timed and reported. The full deployment typically takes a few hours depending on bundle download speeds and environment performance. You can safely interrupt with `Ctrl+C` — the deployer handles graceful shutdown.
 
 Most of my deployments take around 2 hours and 30 minutes. (Tested on physical SDDC vSphere 8u3+ VSAN OSA Cluster with 4 hosts & NVMe Storage + NSX 4.2)

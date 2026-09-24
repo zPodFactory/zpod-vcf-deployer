@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# dependencies = ["httpx", "rich", "typer", "python-dotenv", "jinja2", "typing-extensions", "asyncssh"]
+# dependencies = ["httpx", "rich", "typer", "python-dotenv", "jinja2", "typing-extensions", "asyncssh", "pyvmomi"]
 # ///
 
 import asyncio
@@ -2069,10 +2069,12 @@ async def _wait_and_fix_nsx_vdr_mac(zpod: dict, vcf_json: dict, mac: str):
         )
 
 
-async def _cancel_nsx_fix_task(task):
-    """Cancel and await the background NSX MAC fix task, swallowing the
-    resulting CancelledError. No-op if the task is None or already done."""
-    if task is not None and not task.done():
+async def _cancel_fix_tasks(*tasks):
+    """Cancel and await the background fix tasks, swallowing the resulting
+    CancelledError. Skips any that is None or already done."""
+    for task in tasks:
+        if task is None or task.done():
+            continue
         task.cancel()
         try:
             await task
@@ -2208,6 +2210,442 @@ def _nsx_milestone_started(sddc: dict, milestone_name: str) -> bool:
 
 
 # --- end nested NSX-T VDR MAC collision fix ---------------------------------
+
+
+# --- vSAN ESA AutoRAID / FTT=0 policy fix -----------------------------------
+#
+# VCF 9.1 deploys vSAN ESA, and ESA ignores datastoreSpec.vsanSpec.
+# failuresToTolerate. Auto-policy management builds its own
+# "<cluster> - Optimal Datastore Default Policy - AutoRAID" policy, makes it
+# the datastore default and picks the RAID level from the host count (RAID-1
+# under 5 hosts, then RAID-5, then RAID-6), re-evaluating it as hosts come
+# and go. Every appliance the installer deploys — vCenter, NSX Managers, VCF
+# Operations, SDDC Manager — inherits that instead of the FTT=0 the template
+# asked for, which is the only thing a nested lab has the capacity for.
+#
+# There is no documented installer-spec field to opt out, so the fix is
+# applied against vCenter itself, from two points (same shape as the NSX VDR
+# MAC fix above): a background task that retries until vCenter answers, so
+# everything deployed afterwards is born on the right policy, and a sweep at
+# the end of the deploy that catches whatever was deployed in between. Both
+# run only when the template asks for ESA *and* FTT=0 — a template that asks
+# for FTT=1 gets vSAN's own behaviour, untouched.
+#
+# FTT=0 means losing one host loses the management VMs. Fine for a nested
+# lab, never for production.
+
+VSAN_FTT0_POLICY_NAME = "zPod vSAN ESA - No data redundancy (FTT=0)"
+
+# Oldest PBM API version carrying everything the create spec needs; every
+# 8.x/9.x vCenter still accepts it, so there is nothing to negotiate.
+PBM_API_VERSION = "pbm.version.version11"
+
+# vSAN API version used when the appliance's manifest doesn't map to a
+# binding pyvmomi ships — see _vsan_api_version().
+VSAN_FALLBACK_API_VERSION = "vsan.version.version23"
+
+
+def _vsan_ftt0_requested(vcf_json: dict) -> bool:
+    """True when the template asks for vSAN ESA *and* failuresToTolerate 0 —
+    the exact combination ESA silently overrides with its AutoRAID policy."""
+    vsan_spec = vcf_json.get("datastoreSpec", {}).get("vsanSpec", {})
+    if not vsan_spec.get("esaConfig", {}).get("enabled", False):
+        return False
+    ftt = vsan_spec.get("failuresToTolerate")
+    try:
+        return ftt is not None and int(ftt) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _vcenter_connect(vcf_json: dict):
+    """Log into the management vCenter with the template's own SSO
+    credentials. Returns (service instance, vim stub, ssl context)."""
+    import ssl  # lazy: only the vSAN ESA policy fix needs vSphere API access
+
+    from pyVim.connect import SmartConnect
+
+    vcenter_spec = vcf_json.get("vcenterSpec", {})
+    ssl_context = ssl._create_unverified_context()  # nested VCSA, self-signed
+    si = SmartConnect(
+        host=vcenter_spec["vcenterHostname"],
+        user=f"administrator@{vcenter_spec['ssoDomain']}",
+        pwd=vcenter_spec["adminUserSsoPassword"],
+        sslContext=ssl_context,
+    )
+    return si, si._stub, ssl_context
+
+
+def _vsan_api_version(host: str) -> str:
+    """vSAN API version to talk to this vCenter with, read from the
+    appliance's own version manifest the way the vSAN SDK samples do.
+
+    The version matters twice over: the ESA fields this fix sets only exist
+    from vsan.version.version21 (auto-policy management) and v9_1_0_0
+    (AutoRAID), and a vCenter rejects a version newer than its own — so
+    never guess upwards. Anything unrecognised falls back to version23
+    (8.0 U3), old enough to be accepted everywhere this fix can run and new
+    enough to carry the auto-policy field; only AutoRAID is then skipped.
+    """
+    from pyVmomi import VmomiSupport
+
+    known = VmomiSupport.GetServiceVersions("vsan")
+    try:
+        response = httpx.get(
+            f"https://{host}/sdk/vsanServiceVersions.xml",
+            verify=False,
+            timeout=30,
+        )
+        server_version = max(
+            re.findall(r"<version>([\d.]+)</version>", response.text),
+            key=_version_sort_key,
+        )
+        candidate = f"vsan.version.v{server_version.replace('.', '_')}"
+        if candidate in known:
+            return candidate
+        debug_console.print(
+            f"[dim]vSAN {server_version} has no pyvmomi binding — "
+            f"using {VSAN_FALLBACK_API_VERSION}[/dim]"
+        )
+    except Exception as e:
+        debug_console.print(f"[dim]vSAN version negotiation failed: {e}[/dim]")
+    return VSAN_FALLBACK_API_VERSION
+
+
+def _vsan_config_system(vim_stub, ssl_context, version: str):
+    """Bind the vSAN cluster config MO. It lives on vCenter's separate
+    /vsanHealth endpoint but reuses the vim session cookie."""
+    from pyVmomi import vim
+    from pyVmomi.SoapAdapter import SoapStubAdapter
+
+    stub = SoapStubAdapter(
+        host=vim_stub.host.split(":")[0],
+        path="/vsanHealth",
+        version=version,
+        sslContext=ssl_context,
+    )
+    stub.cookie = vim_stub.cookie
+    return vim.cluster.VsanVcClusterConfigSystem(
+        "vsan-cluster-config-system", stub
+    )
+
+
+def _pbm_profile_manager(vim_stub, ssl_context):
+    """Bind the storage-policy (PBM) manager, on its own /pbm/sdk endpoint.
+    PBM authenticates off the vim session cookie, passed both as a cookie and
+    through the request context."""
+    from pyVmomi import VmomiSupport, pbm
+    from pyVmomi.SoapAdapter import SoapStubAdapter
+
+    VmomiSupport.GetRequestContext()["vcSessionCookie"] = (
+        vim_stub.cookie.split('"')[1]
+    )
+    stub = SoapStubAdapter(
+        host=vim_stub.host.split(":")[0],
+        path="/pbm/sdk",
+        version=PBM_API_VERSION,
+        sslContext=ssl_context,
+    )
+    stub.cookie = vim_stub.cookie
+    service_instance = pbm.ServiceInstance("ServiceInstance", stub)
+    return service_instance.RetrieveContent().profileManager
+
+
+def _find_managed_object(si, mo_type, name: str):
+    """First managed object of `mo_type` called `name`, or None."""
+    view = si.content.viewManager.CreateContainerView(
+        si.content.rootFolder, [mo_type], True
+    )
+    try:
+        return next((mo for mo in view.view if mo.name == name), None)
+    finally:
+        view.Destroy()
+
+
+def _wait_for_task(task, timeout: int = 1800):
+    """Block until a vCenter task settles; raise its error if it failed."""
+    from pyVmomi import vim
+
+    deadline = time.monotonic() + timeout
+    while task.info.state in (
+        vim.TaskInfo.State.queued,
+        vim.TaskInfo.State.running,
+    ):
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"task timed out after {timeout}s")
+        time.sleep(2)
+    if task.info.state != vim.TaskInfo.State.success:
+        raise RuntimeError(getattr(task.info.error, "msg", str(task.info.error)))
+    return task.info.result
+
+
+def _wait_for_vsan_task(vsan_task, vim_stub, timeout: int = 1800):
+    """vSAN tasks come back bound to the /vsanHealth stub, which can't poll
+    them — re-bind to the vim stub first, as the vSAN SDK samples do."""
+    from pyVmomi import vim
+
+    return _wait_for_task(vim.Task(vsan_task._moId, vim_stub), timeout)
+
+
+def _disable_vsan_auto_policy(
+    config_system, cluster, vim_stub, version: str
+) -> bool:
+    """Hand the datastore's default policy back to us: turn off ESA
+    auto-policy management, and AutoRAID on 9.1+. Without this vSAN re-imposes
+    its own policy. Returns True when it actually had to change something."""
+    from pyVmomi import VmomiSupport, vim
+
+    supports_autoraid = VmomiSupport.IsChildVersion(
+        version, "vsan.version.v9_1_0_0"
+    )
+    esa_info = getattr(
+        config_system.VsanClusterGetConfig(cluster), "vsanEsaConfigInfo", None
+    )
+    auto_policy = getattr(esa_info, "datastoreDefaultPolicySelectionConfig", None)
+    auto_raid = getattr(esa_info, "autoRAIDConfig", None)
+    auto_raid_off = (
+        not supports_autoraid
+        or auto_raid is None
+        or not auto_raid.assumeAutoManagedRAID
+    )
+    if (auto_policy is None or not auto_policy.enabled) and auto_raid_off:
+        return False
+
+    esa_config = vim.vsan.VsanEsaConfig(
+        datastoreDefaultPolicySelectionConfig=(
+            vim.vsan.VsanDatastoreDefaultPolicySelectionConfig(enabled=False)
+        )
+    )
+    if supports_autoraid:
+        esa_config.autoRAIDConfig = vim.vsan.AutoRAIDConfig(
+            assumeAutoManagedRAID=False
+        )
+    task = config_system.VsanClusterReconfig(
+        cluster, vim.vsan.ReconfigSpec(modify=True, vsanEsaConfig=esa_config)
+    )
+    _wait_for_vsan_task(task, vim_stub)
+    return True
+
+
+def _ensure_ftt0_profile(profile_manager):
+    """The FTT=0 ("no data redundancy") storage policy, created if it isn't
+    there yet. Returns (profile id, created)."""
+    from pyVmomi import pbm
+
+    resource_type = pbm.profile.ResourceType(
+        resourceType=pbm.profile.ResourceTypeEnum.STORAGE
+    )
+    category = pbm.profile.CapabilityBasedProfile.ProfileCategoryEnum.REQUIREMENT
+
+    existing = profile_manager.PbmQueryProfile(resource_type, category)
+    for profile in profile_manager.PbmRetrieveContent(existing) if existing else []:
+        if profile.name == VSAN_FTT0_POLICY_NAME:
+            return profile.profileId, False
+
+    capability = pbm.capability.CapabilityInstance(
+        id=pbm.capability.CapabilityMetadata.UniqueId(
+            namespace="VSAN", id="hostFailuresToTolerate"
+        ),
+        constraint=[
+            pbm.capability.ConstraintInstance(
+                propertyInstance=[
+                    pbm.capability.PropertyInstance(
+                        id="hostFailuresToTolerate", value=0
+                    )
+                ]
+            )
+        ],
+    )
+    create_spec = pbm.profile.CapabilityBasedProfileCreateSpec(
+        name=VSAN_FTT0_POLICY_NAME,
+        description=(
+            "Created by zpod-vcf-deployer: vSAN ESA ignores the template's "
+            "failuresToTolerate 0, this restores it."
+        ),
+        resourceType=resource_type,
+        category=category,
+        constraints=pbm.profile.SubProfileCapabilityConstraints(
+            subProfiles=[
+                pbm.profile.SubProfileCapabilityConstraints.SubProfile(
+                    name="VSAN sub-profile", capability=[capability]
+                )
+            ]
+        ),
+    )
+    return profile_manager.PbmCreate(create_spec), True
+
+
+def _vm_already_on_profile(profile_manager, vm, profile_id, server_uuid) -> bool:
+    """Whether the VM home is already on our policy. Home and disks are always
+    set together below, so the home is a faithful proxy for both."""
+    from pyVmomi import pbm
+
+    try:
+        current = profile_manager.PbmQueryAssociatedProfile(
+            pbm.ServerObjectRef(
+                objectType=pbm.ServerObjectRef.ObjectType.virtualMachine,
+                key=vm._moId,
+                serverUuid=server_uuid,
+            )
+        )
+    except Exception:
+        return False  # can't tell — reconfigure, it's idempotent anyway
+    return any(p.uniqueId == profile_id.uniqueId for p in current or [])
+
+
+def _apply_profile_to_vms(datastore, profile_manager, profile_id, server_uuid):
+    """Move the VMs already on the datastore onto the policy — VM home and
+    every disk. Returns (changed, skipped, failures)."""
+    from pyVmomi import vim
+
+    changed, skipped, failures = [], [], []
+    for vm in datastore.vm:
+        # VM templates reject ReconfigVM outright ("The operation is not
+        # supported on the object") — VCF ships one, the VCF Services Platform
+        # runtime template.
+        if getattr(getattr(vm, "config", None), "template", False):
+            skipped.append(vm.name)
+            continue
+        if _vm_already_on_profile(profile_manager, vm, profile_id, server_uuid):
+            skipped.append(vm.name)
+            continue
+
+        profile = [vim.vm.DefinedProfileSpec(profileId=profile_id.uniqueId)]
+        config_spec = vim.vm.ConfigSpec(
+            vmProfile=profile,
+            deviceChange=[
+                vim.vm.device.VirtualDeviceSpec(
+                    operation=vim.vm.device.VirtualDeviceSpec.Operation.edit,
+                    device=device,
+                    profile=list(profile),
+                )
+                for device in vm.config.hardware.device
+                if isinstance(device, vim.vm.device.VirtualDisk)
+            ],
+        )
+        try:
+            _wait_for_task(vm.ReconfigVM_Task(config_spec))
+            changed.append(vm.name)
+        except Exception as e:
+            failures.append(f"{vm.name}: {e}")
+    return changed, skipped, failures
+
+
+def _apply_vsan_ftt0_policy(vcf_json: dict) -> dict:
+    """Apply the whole fix against the management vCenter, idempotently.
+
+    Blocking (pyvmomi is synchronous) — always call it off the event loop.
+    Raises while vCenter or the vSAN datastore isn't up yet, which is the
+    background task's cue to retry.
+    """
+    from pyVim.connect import Disconnect
+    from pyVmomi import pbm, vim
+
+    datastore_name = vcf_json["datastoreSpec"]["vsanSpec"]["datastoreName"]
+    cluster_name = vcf_json.get("clusterSpec", {}).get("clusterName")
+
+    si, vim_stub, ssl_context = _vcenter_connect(vcf_json)
+    try:
+        cluster = _find_managed_object(si, vim.ClusterComputeResource, cluster_name)
+        if cluster is None:
+            raise RuntimeError(f"cluster {cluster_name} not in inventory yet")
+        datastore = _find_managed_object(si, vim.Datastore, datastore_name)
+        if datastore is None:
+            raise RuntimeError(f"datastore {datastore_name} not in inventory yet")
+
+        version = _vsan_api_version(vim_stub.host.split(":")[0])
+        auto_policy_disabled = _disable_vsan_auto_policy(
+            _vsan_config_system(vim_stub, ssl_context, version),
+            cluster,
+            vim_stub,
+            version,
+        )
+
+        profile_manager = _pbm_profile_manager(vim_stub, ssl_context)
+        profile_id, profile_created = _ensure_ftt0_profile(profile_manager)
+        profile_manager.PbmAssignDefaultRequirementProfile(
+            profile_id,
+            [pbm.placement.PlacementHub(hubType="Datastore", hubId=datastore._moId)],
+        )
+        changed, skipped, failures = _apply_profile_to_vms(
+            datastore, profile_manager, profile_id, si.content.about.instanceUuid
+        )
+        return {
+            "auto_policy_disabled": auto_policy_disabled,
+            "profile_created": profile_created,
+            "datastore": datastore_name,
+            "changed": changed,
+            "skipped": skipped,
+            "failures": failures,
+        }
+    finally:
+        Disconnect(si)
+
+
+def _print_vsan_ftt0_result(result: dict) -> None:
+    if result["auto_policy_disabled"]:
+        console.print(
+            "  [green]✓[/green] vSAN ESA auto-policy management / AutoRAID "
+            "disabled"
+        )
+    console.print(
+        f"  [green]✓[/green] '{VSAN_FTT0_POLICY_NAME}' "
+        f"{'created' if result['profile_created'] else 'already present'}, set as "
+        f"default policy on {result['datastore']}"
+    )
+    if result["changed"]:
+        console.print(
+            f"  [green]✓[/green] Re-applied to {len(result['changed'])} VM(s): "
+            f"{', '.join(result['changed'])}"
+        )
+    if result["skipped"]:
+        console.print(
+            f"  [dim]{len(result['skipped'])} VM(s) already on the policy[/dim]"
+        )
+    for failure in result["failures"]:
+        console.print(f"  [yellow]⚠️ {failure}[/yellow]")
+
+
+async def _wait_and_fix_vsan_esa_policy(vcf_json: dict, retry_delay: int = 30):
+    """Background task, spawned by initiate_sddc_deployment() when the
+    template asks for ESA with FTT=0. Retries until vCenter answers and the
+    vSAN datastore exists, then applies the policy — early enough that the
+    appliances deployed after it (NSX, VCF Operations, SDDC Manager) are
+    created on the right policy instead of being resynced afterwards."""
+    while True:
+        try:
+            result = await asyncio.to_thread(_apply_vsan_ftt0_policy, vcf_json)
+        except Exception as e:
+            debug_console.print(f"[dim]vSAN FTT=0 fix: {e}, retrying...[/dim]")
+            await asyncio.sleep(retry_delay)
+            continue
+
+        console.print(
+            "[bold cyan]🔧 vSAN ESA FTT=0 storage policy applied[/bold cyan]"
+        )
+        _print_vsan_ftt0_result(result)
+        return
+
+
+async def _run_vsan_ftt0_sweep(vcf_json: dict):
+    """End-of-deploy safety net: re-runs the fix (idempotent) so the
+    appliances deployed after the background task ran land on FTT=0 too.
+    Never fails the deploy — the SDDC is already up by the time this runs."""
+    console.print(
+        "[bold cyan]🔍 Verifying vSAN ESA FTT=0 storage policy...[/bold cyan]"
+    )
+    try:
+        result = await asyncio.to_thread(_apply_vsan_ftt0_policy, vcf_json)
+    except Exception as e:
+        console.print(
+            f"[yellow]⚠️ vSAN FTT=0 policy fix failed: {e} — the management "
+            f"VMs are still on vSAN's AutoRAID policy[/yellow]"
+        )
+        return
+    _print_vsan_ftt0_result(result)
+
+
+# --- end vSAN ESA AutoRAID / FTT=0 policy fix -------------------------------
 
 
 def _find_component_hostnames(vcf_json, hostnames=None):
@@ -3388,6 +3826,16 @@ async def initiate_sddc_deployment(
     # leave NOT_STARTED. See docs/nsx-nested-mac-fix.md.
     nsx_fix_task = None
 
+    # Background vSAN ESA FTT=0 policy fix — unlike the NSX one it has no
+    # milestone to wait for: it retries until vCenter answers, so it lands as
+    # early as the inventory allows and the later appliances are deployed on
+    # the right policy. Only started when the template asks for it.
+    vsan_fix_task = (
+        asyncio.create_task(_wait_and_fix_vsan_esa_policy(vcf_json))
+        if _vsan_ftt0_requested(vcf_json)
+        else None
+    )
+
     # Create new deployment if no sddc_id provided
     if not sddc_id:
         # Guard against creating a duplicate: if a deployment already exists
@@ -3535,13 +3983,13 @@ async def initiate_sddc_deployment(
                 "\n\n⚠️ [yellow]Deployment monitoring interrupted by user (Ctrl+C)[/yellow]"
             )
             console.print("🔄 [blue]Stopping deployment monitoring...[/blue]")
-            await _cancel_nsx_fix_task(nsx_fix_task)
+            await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
             return
         except Exception as e:
             if live:
                 live.stop()
             console.print(f"\n❌ [red]Error in deployment monitoring: {e}[/red]")
-            await _cancel_nsx_fix_task(nsx_fix_task)
+            await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
             raise typer.Exit(code=1)
         finally:
             # Guarantee cleanup: stop() is a no-op if not started / already
@@ -3559,8 +4007,12 @@ async def initiate_sddc_deployment(
             # attach to an already-complete deployment (this branch is hit
             # on the very first poll) — the safety net below is what does
             # the real work in that case. Await/cancel it first either way.
-            await _cancel_nsx_fix_task(nsx_fix_task)
+            await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
+            # NSX first: its fix is what restores the routed path to vcsa the
+            # vSAN sweep needs.
             await _run_nsx_mac_diagnostic(zpod, vcf_json, nested_nsx_vdr_mac)
+            if _vsan_ftt0_requested(vcf_json):
+                await _run_vsan_ftt0_sweep(vcf_json)
             return
 
         if sddc_status == "COMPLETED_WITH_FAILURE":
@@ -3571,7 +4023,7 @@ async def initiate_sddc_deployment(
                 )
                 # Full payload already dumped to the debug log on the
                 # terminal-state break above.
-                await _cancel_nsx_fix_task(nsx_fix_task)
+                await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
                 raise typer.Exit(code=1)
 
             resume_attempt += 1
@@ -3611,11 +4063,11 @@ async def initiate_sddc_deployment(
             console.print("\n[bold red]❌ SDDC deployment failed[/bold red]")
             # Full payload already dumped to the debug log on the
             # terminal-state break above.
-            await _cancel_nsx_fix_task(nsx_fix_task)
+            await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
             raise typer.Exit(code=1)
 
         console.print(f"\n[bold red]❌ Unexpected status: {sddc_status}[/bold red]")
-        await _cancel_nsx_fix_task(nsx_fix_task)
+        await _cancel_fix_tasks(nsx_fix_task, vsan_fix_task)
         raise typer.Exit(code=1)
 
 
