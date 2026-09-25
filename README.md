@@ -265,14 +265,14 @@ uv run zpod-vcf-deployer.py --help
 | `config/v9.0.1.0_std_4hosts.json` | 9.0.1.0 | 4 | GA (full versions) | GA — standard 4-host deployment |
 | `config/v9.0.2.0_std_3hosts.json` | 9.0.2.0 | 3 | GA (full versions) | GA |
 | `config/v9.1.0.0_std_3hosts.json` | 9.1.0.0 | 3 | GA (full versions) | GA (vSAN ESA, VCF Services Platform) |
-| `config/v9.1-latest_std_3hosts.json` | 9.1.0.0 | 3 | none (omitted) | Latest of the **9.1.x** line — deploys the newest available per component (incl. express patches) |
+| `config/v9.1-latest_std_3hosts.json` | 9.1.1.0 | 3 | none (omitted) | Latest of the **9.1.x** line — deploys the newest available per component (incl. express patches) |
 
 Templates are Jinja2-enabled JSON files. Variables like `{{zpod_name}}`, `{{zpod_domain}}`, and `{{zpod_password}}` are automatically populated from the zPod configuration at deploy time.
 
 **Version pinning.** Two flavors:
 
 - **GA configs** pin every component spec to its full, build-qualified GA `productVersion` (e.g. `9.1.0.0.25370922`) as returned by the depot's `release-components` API. One per maintenance release (`9.0.0.0`, `9.0.1.0`, `9.0.2.0`, `9.1.0.0`).
-- **`-latest` configs omit `version`**, so the Installer deploys the newest available version per component (its documented default — per [William Lam's VCF 9.1 quick tip](https://williamlam.com/2026/06/vcf-9-1-quick-tip-understanding-vcf-installer-default-behavior-for-vcf-patch-releases.html)), including express patches. The top-level `version` points at the newest maintenance release of the line (`v9.1-latest` → `9.1.0.0`); bump it when a newer one ships (`9.1.1`…) — there is no auto-discovery.
+- **`-latest` configs omit `version`**, so the Installer deploys the newest available version per component (its documented default — per [William Lam's VCF 9.1 quick tip](https://williamlam.com/2026/06/vcf-9-1-quick-tip-understanding-vcf-installer-default-behavior-for-vcf-patch-releases.html)), including express patches. The top-level `version` points at the newest maintenance release of the line (`v9.1-latest` → `9.1.1.0`); bump it when a newer one ships — there is no auto-discovery.
 
 > **Express patches at bring-up are 9.1+ only.** VCF **9.0.x** rejects patch component versions during initial deployment (`FAILED_TO_VALIDATE_COMPONENT_VERSION_NO_PATCH_VERSIONS_ALLOWED`) — on that line you deploy GA and patch afterward via LCM, so there is no 9.0 `-latest` template. VCF **9.1+** (new activation system) accepts express-patch versions at bring-up, which is why `v9.1-latest` deploys `…0100` builds directly.
 

@@ -2,7 +2,7 @@
   "sddcId": "mgmt-domain",
   "vcfInstanceName": "vcf-{{zpod_name}}",
   "workflowType": "VCF",
-  "version": "9.1.0.0",
+  "version": "9.1.1.0",
   "skipEsxThumbprintValidation": true,
   "ceipEnabled": false,
   "hostSpecs": [
