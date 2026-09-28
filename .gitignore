@@ -5,3 +5,9 @@ __pycache__/
 # Debug logs (--debug-log) contain hostnames, IPs and plaintext passwords
 zpod-vcf-deployer-*.log
 *.log
+
+# Local list of strings that must never enter the history (tools/release.py --check)
+.release-denylist
+
+# Scratch files from planning sessions
+tmp/

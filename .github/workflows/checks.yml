@@ -1,9 +1,12 @@
 name: checks
 
-# On every push and pull request: the release-time rules that must hold between releases too.
-# VERSION in the script equals the newest CHANGELOG.md section, every tag has a section,
+# On every push and pull request: the release-time rules that must hold between releases
+# too. The shipped version equals the newest CHANGELOG.md section, every tag has a section,
 # nothing that must stay local is tracked. The forbidden-string list is local only (it would
-# leak what it guards), so that part of the check runs on the machine that cuts the release.
+# leak what it guards), so that part runs on the machine that cuts the release.
+#
+# Identical in every zPodFactory repository, except the `tests` job, which exists only where
+# there is an offline suite to run.
 on:
   push:
   pull_request:
@@ -15,5 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
       - run: python3 tools/release.py --check
       - run: python3 tools/release_notes.py --check
+

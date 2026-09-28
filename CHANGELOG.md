@@ -3,17 +3,30 @@
 Notable changes, newest first. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Cutting a release.** Every change lands under `[Unreleased]` as it is made. When enough has
-accumulated, `python3 tools/release.py X.Y.Z --push` does the rest: that heading becomes the new
-version, `VERSION` in `zpod-vcf-deployer.py` moves with it, the commit is tagged `vX.Y.Z` and
-pushed, and the tag publishes its changelog section as the GitHub release. The script refuses a
-dirty tree, an empty `[Unreleased]`, a version not above the last tag, a tracked log or `.env`,
-and any string from the local `.release-denylist`; `--check` runs the same rules and CI runs it
-on every push. The `0.x` line stays pre-1.0 while the shape of the tool can still move; a change
-that breaks a flag, a template field or an output someone may parse is named in a **Breaking**
-section, which is what warns a reader, not the digit.
+Entries say what changed for the person using the tool, and why in a clause. Every change
+lands under `[Unreleased]` as it is made.
+
+**Cutting a release.** `python3 tools/release.py X.Y.Z --push` does the rest: `[Unreleased]`
+becomes `[X.Y.Z] — date`, the shipped version moves with it, the commit is tagged `vX.Y.Z` and
+pushed, and the tag publishes this file's section as the GitHub release note
+(`.github/workflows/release.yml`, `tools/release_notes.py`). The script refuses a dirty tree,
+an empty `[Unreleased]`, a version not above the last tag, a tracked log or `.env`, and any
+string from the local `.release-denylist`; `--check` runs the same rules, and CI runs it on
+every push. Preview a note with `python3 tools/release_notes.py X.Y.Z`.
+
+The `0.x` line stays pre-1.0 while the shape of the tool can still move; a change that breaks
+a flag or an output someone may parse is named in a **Breaking** section, which is what warns
+a reader, not the digit.
 
 ## [Unreleased]
+
+### Changed
+
+- **Releases follow the shared zPodFactory standard.** `tools/release.py` (cut, `--check`,
+  `--draft`, `--from-commits`) and `tools/release_notes.py` are the same files as in every other
+  repository, with a configuration block at the top; `tools/README.md` explains the release in a
+  page. The workflow re-checks before publishing. Why: six repositories had four variants of the
+  same idea.
 
 ## [0.1.0] — 2026-09-28
 

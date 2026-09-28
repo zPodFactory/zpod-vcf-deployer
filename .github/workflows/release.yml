@@ -1,21 +1,23 @@
 name: release
 
-# A tag is not a release note. Pushing `v0.2.5` left the Releases tab showing a version
-# number with nothing under it, while the changelog for that version sat in the repository,
-# written — so this reads the section `CHANGELOG.md` already has and publishes it as the
-# body of the release.
+# A tag is not a release note. Pushing `v0.2.5` alone leaves the Releases tab showing a
+# version number with nothing under it, while the changelog for that version sits in the
+# repository, written. So this reads the section `CHANGELOG.md` already has and publishes
+# it as the body of the release, after checking that the tag, the changelog and the shipped
+# version agree.
 #
 # Here rather than only as a local command, because the rule is "every tag gets its notes"
-# and a rule that depends on somebody remembering a second command is a rule that holds
-# until the first hurried release.
+# and a rule that depends on somebody remembering a second command holds until the first
+# hurried release. Identical in every zPodFactory repository; what differs lives in the
+# configuration block at the top of tools/release.py and tools/release_notes.py.
 on:
   push:
     tags: ["v*"]
-  # For fixing a release note after the fact, or backfilling one that predates this.
+  # For fixing a release note after the fact, or backfilling tags that predate this.
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to (re)publish, e.g. 0.3.0 — blank means every tag"
+        description: "Version to (re)publish, e.g. 0.3.0; blank means every tag"
         required: false
         default: ""
 
@@ -30,10 +32,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # The note ends with a compare link against the previous tag, which needs the
-          # tags — and a default checkout fetches none of them.
+          # tags; a default checkout fetches none of them.
           fetch-depth: 0
-      # No uv and no `uv run`: tools/release_notes.py is standard library only, and a
-      # release note should not wait on a dependency tree it does not use.
+          fetch-tags: true
+      # No uv, no dependency tree: both tools are standard library only.
+      - name: check
+        run: |
+          python3 tools/release.py --check
+          python3 tools/release_notes.py --check
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}

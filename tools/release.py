@@ -1,31 +1,42 @@
 #!/usr/bin/env python3
-"""Cut a version: changelog heading, VERSION, commit, tag — and refuse when something is off.
+"""Cut a version, or check that the repository is fit to cut one. Standard library only.
 
-    python3 tools/release.py --check              # what CI runs: version, changelog, tags, tree
+    python3 tools/release.py --check              # what CI runs on every push
+    python3 tools/release.py --draft              # the commits since the last tag, as entry
+                                                  # candidates for [Unreleased]; prints, writes nothing
+    python3 tools/release.py --draft --write      # ... and writes them under [Unreleased] for you to edit
+    python3 tools/release.py 0.3.0 --push --from-commits   # the whole release in one command: fill
+                                                  # [Unreleased] from the commits, cut, push
     python3 tools/release.py 0.3.0 --dry-run      # show what a cut would do
-    python3 tools/release.py 0.3.0                # cut it: CHANGELOG.md, VERSION, commit, tag v0.3.0
-    python3 tools/release.py 0.3.0 --push         # …and push main and the tag; the release workflow
-                                                  # then publishes the changelog section as the note
+    python3 tools/release.py 0.3.0                # cut it: CHANGELOG.md, the version, commit, tag
+    python3 tools/release.py 0.3.0 --push         # ... and push main and the tag; the release
+                                                  # workflow then publishes the changelog section
 
-What a cut does, in order, stopping at the first thing that is wrong:
+A cut, in order, stopping at the first thing that is wrong:
 
-1. The working tree is clean and on `main`.
-2. `CHANGELOG.md` has a non-empty `[Unreleased]` section: a release with nothing to say is not
-   a release.
-3. The version is higher than the newest tag.
-4. Nothing that must stay local is tracked: no `*.log`, nothing under `runs/`, no `.env`.
-5. No forbidden string is in the tree or in the commits since the last tag (messages and diffs).
-   The patterns come from `.release-denylist` next to this repository's root, one per line,
-   case-insensitive, and that file is git-ignored on purpose: the names it guards against must
-   not enter history through the guard itself. Absent file: the check is skipped, loudly.
-6. `[Unreleased]` becomes `[X.Y.Z] — <today>` with a fresh empty `[Unreleased]` above it, and
-   `VERSION = "X.Y.Z"` in the script moves with it.
-7. One commit, `Release X.Y.Z`, and an annotated tag `vX.Y.Z` whose message is the first
-   bullet of the section. `--push` pushes both; `.github/workflows/release.yml` then publishes
-   the section as the GitHub release through `tools/release_notes.py`.
+1. The working tree is clean and on `main`; the version has the shape this project uses and
+   is above the newest tag; every file the version names exists (packer: the var file).
+2. `CHANGELOG.md` has a non-empty `[Unreleased]` section: a release with nothing to say is
+   not a release.
+3. Nothing that must stay local is tracked (no `.env`, no `*.log`, nothing under `runs/`), and
+   no string from the local, git-ignored `.release-denylist` is in the tree or in the commits
+   since the last tag. Absent denylist: the check is skipped, loudly.
+4. `[Unreleased]` becomes `[X.Y.Z] — <today>` with a fresh empty `[Unreleased]` above it; the
+   version moves in VERSION_FILE (and in ALSO_UPDATE); TEST_COMMAND runs, if set.
+5. One commit, `Release X.Y.Z`, and an annotated tag `vX.Y.Z`. `--push` pushes both.
 
-`--check` runs steps 4 and 5 plus the consistency rules CI enforces on every push: `VERSION`
-equals the newest changelog version, and every tag has a changelog section.
+`--check` runs step 3 plus the two rules CI enforces on every push: the shipped version equals
+the newest changelog section, and every tag has a changelog section.
+
+`--draft` is the starting point for the entries, not the entries: it lists the commits since the
+newest tag, oldest first, sorted into Added / Changed / Fixed / Removed by their subject, with
+housekeeping commits (docs, page revisions, release tooling) set apart. The person, or the
+session, cutting the release rewrites the candidates into what changed for the user of the
+tool and why, then runs the cut. `--write` puts the candidates under `[Unreleased]` as they are,
+for editing; `--from-commits` on a cut does the same and cuts in the same run, which is the
+one-command release for a stretch of plain fixes: the commit subjects become the entries.
+
+The block below is the only part that differs between repositories.
 """
 
 from __future__ import annotations
@@ -37,16 +48,25 @@ import subprocess
 import sys
 from pathlib import Path
 
+# ── per-repository configuration ─────────────────────────────────────────────────────
+PROJECT = "zpod-vcf-deployer"
+VERSION_FILE = "zpod-vcf-deployer.py"              # where the shipped version is written
+VERSION_PATTERN = r'^VERSION = "([^"]+)"$'   # one capture group: the version
+VERSION_SHAPE = r"\d+\.\d+\.\d+"                 # what a version looks like here
+VERSION_IN_FILE = "{version}"             # what is written into VERSION_FILE
+REQUIRED_FILES: tuple[str, ...] = ()             # must exist before a cut; {version} {major_minor}
+ALSO_UPDATE: dict[str, str] = {}                 # other files: path -> regex with one group
+TEST_COMMAND: tuple[str, ...] = ()   # () when there is no suite
+MUST_STAY_LOCAL = r"(^|/)\.env$|\.log$|^runs/"
+# ─────────────────────────────────────────────────────────────────────────────────────
+
 ROOT = Path(__file__).resolve().parent.parent
 CHANGELOG = ROOT / "CHANGELOG.md"
-SCRIPT = ROOT / "zpod-vcf-deployer.py"
 DENYLIST = ROOT / ".release-denylist"
-MUST_STAY_LOCAL = re.compile(r"(^|/)\.env$|\.log$|^runs/")
 
 
 def git(*args: str, check: bool = True) -> str:
-    return subprocess.run(("git", *args), cwd=ROOT, capture_output=True, text=True,
-                          check=check).stdout.strip()
+    return subprocess.run(("git", *args), cwd=ROOT, capture_output=True, text=True, check=check).stdout.strip()
 
 
 def fail(message: str) -> None:
@@ -58,7 +78,15 @@ def ok(message: str) -> None:
     print(f"✓ {message}")
 
 
-# ── the file and the script ──────────────────────────────────────────────────────────
+def vkey(version: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", version))
+
+
+def major_minor(version: str) -> str:
+    return ".".join(version.split(".")[:2])
+
+
+# ── the changelog and the version ────────────────────────────────────────────────────
 
 
 def changelog_versions() -> list[str]:
@@ -67,23 +95,29 @@ def changelog_versions() -> list[str]:
 
 
 def unreleased_body() -> str:
-    text = CHANGELOG.read_text()
-    m = re.search(r"^## \[Unreleased\]\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+    m = re.search(r"^## \[Unreleased\]\n(.*?)(?=^## \[|\Z)", CHANGELOG.read_text(), re.M | re.S)
     return (m.group(1) if m else "").strip()
 
 
-def script_version() -> str:
-    m = re.search(r'^VERSION = "([^"]+)"$', SCRIPT.read_text(), re.M)
+def shipped_version() -> str:
+    m = re.search(VERSION_PATTERN, (ROOT / VERSION_FILE).read_text(), re.M)
     return m.group(1) if m else ""
 
 
+def in_file(version: str) -> str:
+    return VERSION_IN_FILE.format(version=version, major_minor=major_minor(version))
+
+
+def set_version(path: Path, pattern: str, version: str) -> None:
+    text = path.read_text()
+    m = re.search(pattern, text, re.M)
+    if not m:
+        fail(f"{path.name}: nothing matches {pattern!r}")
+    path.write_text(text[: m.start(1)] + version + text[m.end(1):])
+
+
 def tags() -> list[str]:
-    listing = git("tag", "-l", "v[0-9]*", "--sort=-v:refname")
-    return [t for t in listing.splitlines() if t]
-
-
-def vkey(version: str) -> tuple[int, ...]:
-    return tuple(int(p) for p in re.findall(r"\d+", version))
+    return [t for t in git("tag", "-l", "v[0-9]*", "--sort=-v:refname").splitlines() if t]
 
 
 # ── the checks ───────────────────────────────────────────────────────────────────────
@@ -91,7 +125,7 @@ def vkey(version: str) -> tuple[int, ...]:
 
 def check_tracked_files() -> None:
     tracked = git("ls-files").splitlines()
-    leaked = [f for f in tracked if MUST_STAY_LOCAL.search(f)]
+    leaked = [f for f in tracked if re.search(MUST_STAY_LOCAL, f)]
     if leaked:
         fail("tracked but must stay local: " + ", ".join(leaked))
     ok(f"nothing local is tracked ({len(tracked)} files)")
@@ -99,8 +133,7 @@ def check_tracked_files() -> None:
 
 def check_denylist(since: str | None) -> None:
     if not DENYLIST.is_file():
-        print("! no .release-denylist next to the repository: the forbidden-string check is skipped",
-              file=sys.stderr)
+        print("! no .release-denylist next to the repository: the forbidden-string check is skipped", file=sys.stderr)
         return
     patterns = [p.strip() for p in DENYLIST.read_text().splitlines() if p.strip() and not p.startswith("#")]
     if not patterns:
@@ -113,18 +146,15 @@ def check_denylist(since: str | None) -> None:
             text = (ROOT / path).read_text(errors="replace")
         except OSError:
             continue
-        for n, line in enumerate(text.splitlines(), 1):
-            if regex.search(line):
-                hits.append(f"{path}:{n}")
+        hits += [f"{path}:{n}" for n, line in enumerate(text.splitlines(), 1) if regex.search(line)]
     scope = f"{since}..HEAD" if since else "HEAD"
-    log = git("log", "-p", "--format=%H %s%n%b", scope, check=False)
-    for line in log.splitlines():
+    for line in git("log", "-p", "--format=%H %s%n%b", scope, check=False).splitlines():
         if regex.search(line):
             hits.append(f"history {scope}: {line.strip()[:80]}")
             if len(hits) > 20:
                 break
     if hits:
-        fail(f"forbidden string(s) from .release-denylist found:\n  " + "\n  ".join(hits[:20]))
+        fail("forbidden string(s) from .release-denylist found:\n  " + "\n  ".join(hits[:20]))
     ok(f"no forbidden string in the tree or in {scope} ({len(patterns)} pattern(s))")
 
 
@@ -132,10 +162,10 @@ def check_consistency() -> None:
     versions = changelog_versions()
     if not versions:
         fail("CHANGELOG.md has no released section")
-    newest, current = versions[0], script_version()
-    if current != newest:
-        fail(f'VERSION = "{current}" in the script, but the newest changelog section is [{newest}]')
-    ok(f"VERSION {current} matches the newest changelog section")
+    newest, current = versions[0], shipped_version()
+    if current != in_file(newest):
+        fail(f"{VERSION_FILE} ships {current or 'no version'}, but the newest changelog section is [{newest}]")
+    ok(f"{VERSION_FILE} ships {current}, the newest changelog section")
     missing = [t for t in tags() if t.removeprefix("v") not in versions]
     if missing:
         fail("tagged, but not in CHANGELOG.md: " + ", ".join(missing))
@@ -148,47 +178,130 @@ def check_all() -> None:
     check_consistency()
 
 
+# ── the draft ────────────────────────────────────────────────────────────────────────
+
+GROUPS = (
+    ("Removed", r"^(remove|drop|delete|retire)\b"),
+    ("Fixed", r"^(fix|refuse|repair|correct|guard)\b|\bbug\b"),
+    ("Added", r"^(add|new|introduce|support)\b|\bnew\b"),
+)
+HOUSEKEEPING = r"^(docs?|page rev|readme|changelog|journal|version|tests?|ci)\b"
+
+
+def draft_groups() -> tuple[str, dict[str, list[str]]]:
+    """The newest tag, and the commits since it grouped as entry candidates."""
+    latest = tags()[0] if tags() else ""
+    span = f"{latest}..HEAD" if latest else "HEAD"
+    log = git("log", "--no-merges", "--reverse", "--format=%h%x1f%s%x1f%b%x1e", span)
+    commits = [(c.strip("\n").split("\x1f") + ["", ""])[:3] for c in log.split("\x1e") if c.strip()]
+    groups: dict[str, list[str]] = {"Added": [], "Changed": [], "Fixed": [], "Removed": [], "housekeeping, probably no entry": []}
+    for short, subject, body in commits:
+        short, subject = short.strip(), subject.strip()
+        first = next((ln.strip() for ln in body.strip().splitlines() if ln.strip() and not ln.startswith("Co-Authored-By")), "")
+        line = f"- **{subject.rstrip('.')}.** ({short})" + (f" {first}" if first else "")
+        if re.search(HOUSEKEEPING, subject, re.I):
+            groups["housekeeping, probably no entry"].append(line)
+            continue
+        for name, pattern in GROUPS:
+            if re.search(pattern, subject, re.I):
+                groups[name].append(line)
+                break
+        else:
+            groups["Changed"].append(line)
+    return latest, groups
+
+
+def draft() -> str:
+    """The commits since the newest tag as entry candidates for [Unreleased], grouped."""
+    latest, groups = draft_groups()
+    if not any(groups.values()):
+        return f"no commit since {latest or 'the beginning'}: nothing to draft"
+    out = [f"# {sum(len(v) for v in groups.values())} commit(s) since {latest or 'the beginning'}, oldest first. Candidates, not entries:",
+           "# rewrite each as what changed for the person using the tool, and why, under [Unreleased]."]
+    for name, lines in groups.items():
+        if lines:
+            out += ["", f"### {name}", ""] + lines
+    existing = unreleased_body()
+    out += ["", "# already under [Unreleased]:" if existing else "# [Unreleased] is empty."]
+    if existing:
+        out += ["#   " + ln for ln in existing.splitlines()]
+    return "\n".join(out)
+
+
+def write_draft() -> int:
+    """Put the candidates (housekeeping excluded) under [Unreleased], after what is there.
+    Returns how many lines were written."""
+    _latest, groups = draft_groups()
+    blocks = [f"### {name}\n\n" + "\n".join(lines) for name, lines in groups.items()
+              if lines and not name.startswith("housekeeping")]
+    if not blocks:
+        return 0
+    text = CHANGELOG.read_text()
+    m = re.search(r"^## \[Unreleased\]\n(.*?)(?=^## \[|\Z)", text, re.M | re.S)
+    if not m:
+        fail("CHANGELOG.md has no [Unreleased] section")
+    body = (m.group(1).rstrip() + "\n\n" + "\n\n".join(blocks) + "\n\n").lstrip("\n")
+    CHANGELOG.write_text(text[: m.start(1)] + "\n" + body + text[m.end(1):])
+    return sum(len(b.splitlines()) for b in blocks)
+
+
 # ── the cut ──────────────────────────────────────────────────────────────────────────
 
 
-def cut(version: str, *, dry_run: bool, push: bool) -> None:
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-        fail(f"'{version}' is not X.Y.Z")
+def cut(version: str, *, dry_run: bool, push: bool, from_commits: bool = False) -> None:
+    version = version.removeprefix("v")
+    if not re.fullmatch(VERSION_SHAPE, version):
+        fail(f"'{version}' does not look like {VERSION_SHAPE}")
     if git("status", "--porcelain"):
         fail("the working tree is not clean; commit or stash first")
-    branch = git("rev-parse", "--abbrev-ref", "HEAD")
-    if branch != "main":
+    if (branch := git("rev-parse", "--abbrev-ref", "HEAD")) != "main":
         fail(f"on branch {branch}, releases are cut from main")
-    body = unreleased_body()
-    if not body:
-        fail("CHANGELOG.md has an empty [Unreleased] section: nothing to release")
     latest = tags()[0] if tags() else ""
     if latest and vkey(version) <= vkey(latest):
         fail(f"{version} is not above the newest tag {latest}")
     if version in changelog_versions():
         fail(f"CHANGELOG.md already has a [{version}] section")
+    for template in REQUIRED_FILES:
+        needed = template.format(version=version, major_minor=major_minor(version))
+        if not (ROOT / needed).exists():
+            fail(f"{needed} does not exist; create it before cutting {version}")
+    if from_commits and not dry_run:
+        written = write_draft()
+        ok(f"[Unreleased] filled from the commits since {latest or 'the beginning'} ({written} line(s))")
+    body = unreleased_body()
+    if from_commits and dry_run:
+        _l, groups = draft_groups()
+        candidates = "\n\n".join(f"### {n}\n\n" + "\n".join(ls) for n, ls in groups.items() if ls and not n.startswith("housekeeping"))
+        body = (body + "\n\n" + candidates).strip() if candidates else body
+        ok(f"would fill [Unreleased] from the commits since {latest or 'the beginning'}")
+    if not body:
+        fail("CHANGELOG.md has an empty [Unreleased] section: nothing to release"
+             + ("" if from_commits else " (write it, or cut with --from-commits)"))
     check_tracked_files()
     check_denylist(latest or None)
 
-    today = dt.date.today().isoformat()
-    heading = f"## [{version}] — {today}"
-    first_bullet = next((line.lstrip("- ").strip() for line in body.splitlines() if line.startswith("- ")), "")
-    tag_message = f"zpod-wld-deployer {version}" + (f": {re.sub(r'[*`]', '', first_bullet)[:100]}" if first_bullet else "")
-
+    heading = f"## [{version}] — {dt.date.today().isoformat()}"
+    first = next((line.lstrip("- ").strip() for line in body.splitlines() if line.startswith("- ")), "")
+    tag_message = f"{PROJECT} {version}" + (f": {re.sub(r'[*`]', '', first)[:100]}" if first else "")
     print(f"\n{heading}\n{body[:400]}{'…' if len(body) > 400 else ''}\n")
     if dry_run:
-        print(f"dry run: would write {heading}, set VERSION = \"{version}\", commit 'Release {version}', tag v{version}"
-              + (", push main and the tag" if push else ""))
+        print(f"dry run: would write {heading}, set {in_file(version)} in {VERSION_FILE}"
+              + (f" and {', '.join(ALSO_UPDATE)}" if ALSO_UPDATE else "")
+              + (f", run {' '.join(TEST_COMMAND)}" if TEST_COMMAND else "")
+              + f", commit 'Release {version}', tag v{version}" + (", push main and the tag" if push else ""))
         return
 
-    text = CHANGELOG.read_text()
-    text = text.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{heading}\n", 1)
+    text = CHANGELOG.read_text().replace("## [Unreleased]\n", f"## [Unreleased]\n\n{heading}\n", 1)
     CHANGELOG.write_text(re.sub(r"\n{3,}", "\n\n", text))
-    script = SCRIPT.read_text()
-    SCRIPT.write_text(re.sub(r'^VERSION = "[^"]+"$', f'VERSION = "{version}"', script, count=1, flags=re.M))
+    set_version(ROOT / VERSION_FILE, VERSION_PATTERN, in_file(version))
+    for path, pattern in ALSO_UPDATE.items():
+        set_version(ROOT / path, pattern, version)
     check_consistency()
+    if TEST_COMMAND and subprocess.run(TEST_COMMAND, cwd=ROOT).returncode != 0:
+        git("checkout", "--", ".")
+        fail("tests failed: nothing released, files restored")
 
-    git("add", str(CHANGELOG), str(SCRIPT))
+    git("add", "-A")
     git("commit", "-q", "-m", f"Release {version}")
     git("tag", "-a", f"v{version}", "-m", tag_message)
     ok(f"committed 'Release {version}' and tagged v{version}")
@@ -202,17 +315,26 @@ def cut(version: str, *, dry_run: bool, push: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("version", nargs="?", help="X.Y.Z to cut")
+    parser.add_argument("version", nargs="?", help="the version to cut")
     parser.add_argument("--check", action="store_true", help="run the release-time checks and exit")
+    parser.add_argument("--draft", action="store_true", help="print the commits since the last tag as entry candidates")
+    parser.add_argument("--write", action="store_true", help="with --draft: write the candidates under [Unreleased]")
+    parser.add_argument("--from-commits", action="store_true", help="with a version: fill [Unreleased] from the commits, then cut")
     parser.add_argument("--dry-run", action="store_true", help="show what a cut would do")
     parser.add_argument("--push", action="store_true", help="push main and the tag after cutting")
     args = parser.parse_args(argv)
     if args.check:
         check_all()
         return 0
+    if args.draft:
+        print(draft())
+        if args.write:
+            n = write_draft()
+            print(f"\nwrote {n} line(s) under [Unreleased] in CHANGELOG.md; edit, then cut" if n else "\nnothing to write")
+        return 0
     if not args.version:
-        parser.error("name a version, or pass --check")
-    cut(args.version, dry_run=args.dry_run, push=args.push)
+        parser.error("name a version, or pass --check or --draft")
+    cut(args.version, dry_run=args.dry_run, push=args.push, from_commits=args.from_commits)
     return 0
 
 
