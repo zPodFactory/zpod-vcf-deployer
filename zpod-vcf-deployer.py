@@ -30,6 +30,8 @@ from typing_extensions import Annotated
 
 load_dotenv()
 
+VERSION = "0.1.0"
+
 app = typer.Typer(
     help="zPod VCF Deployer - Unified deployment and VCF depot management tool",
     rich_markup_mode="rich",
@@ -141,7 +143,7 @@ def version_callback(value: bool):
         typer.Exit: Always exits after displaying version
     """
     if value:
-        console.print("zPod VCF Deployer version 1.0.0")
+        console.print(f"zPod VCF Deployer version {VERSION}")
         raise typer.Exit()
 
 

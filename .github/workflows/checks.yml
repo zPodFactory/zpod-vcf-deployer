@@ -1,0 +1,19 @@
+name: checks
+
+# On every push and pull request: the release-time rules that must hold between releases too.
+# VERSION in the script equals the newest CHANGELOG.md section, every tag has a section,
+# nothing that must stay local is tracked. The forbidden-string list is local only (it would
+# leak what it guards), so that part of the check runs on the machine that cuts the release.
+on:
+  push:
+  pull_request:
+
+jobs:
+  release-rules:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: python3 tools/release.py --check
+      - run: python3 tools/release_notes.py --check
