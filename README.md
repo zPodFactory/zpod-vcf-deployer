@@ -413,7 +413,7 @@ When you run the deployer, it executes these steps in order:
 
 1. **Provision zPod** — Creates a new zPod via the zPodFactory API and waits for it to become active
 2. **Render VCF config** — Processes the Jinja2 template with zPod-specific variables (network, domain, passwords)
-3. **Prepare ESXi hosts** *(VCF 9.1 only)* — Installs the [nested vSAN ESA mock-HW VIB](https://github.com/lamw/nested-vsan-esa-mock-hw-vib) on each ESXi host over SSH, since VCF 9.1 enables vSAN ESA on nested hardware. Idempotent — skips hosts that already have the VIB.
+3. **Prepare ESXi hosts** *(VCF 9.1, or any version with `--balloon-driver-vib`)* — Installs the [nested vSAN ESA mock-HW VIB](https://github.com/lamw/nested-vsan-esa-mock-hw-vib) on each ESXi host over SSH, since VCF 9.1 enables vSAN ESA on nested hardware. Idempotent — skips hosts that already have the VIB. With `--balloon-driver-vib PATH` (any VCF version), it also installs the zNestedBalloon `zballoon` VIB on each host and loads its `zballoon` balloon driver; pass the artifact built for the template's ESXi release (8.0, 9.0 or 9.1), and Secure Boot must be off.
 4. **Configure DNS** — Creates DNS records for all VCF components (vCenter, NSX, SDDC Manager…), from the [hostname → IP mapping](#hostname--ip-mapping-ipsjson-sidecar) a template can override with a `.ips.json` sidecar
 5. **Set up VCF depot** — Configures the online or offline depot on the VCF installer
 6. **Download bundles** — Downloads required VCF bundles (ESXi, vCenter, NSX-T, etc.)
