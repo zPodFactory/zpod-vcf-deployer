@@ -20,6 +20,14 @@ a reader, not the digit.
 
 ## [Unreleased]
 
+### Added
+
+- **`--balloon-driver-vib PATH` installs the zNestedBalloon driver on every nested ESXi host.**
+  Off unless given. In phase 3, before VCF bring-up, it copies the `zballoon` VIB (community
+  acceptance, one build per ESXi release), installs it, loads the `zballoon` module and fails
+  the deploy if the module or its `running` log line is missing. Why: lets the physical host
+  reclaim memory that sits free inside nested hosts.
+
 ### Fixed
 
 - **The vSAN ESA FTT=0 fix is re-applied whatever the deploy outcome.** It used to run again

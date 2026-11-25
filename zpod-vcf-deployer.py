@@ -290,6 +290,20 @@ def main(
             envvar="NESTED_NSX_VDR_MAC",
         ),
     ] = "02:50:56:42:42:42",
+    balloon_driver_vib: Annotated[
+        Path,
+        typer.Option(
+            "--balloon-driver-vib",
+            help="Opt-in: install this zNestedBalloon VIB (zballoon, "
+            "CommunitySupported) on every nested ESXi host and load its "
+            "zballoon module, before VCF bring-up. Use the artifact built "
+            "for the template's ESXi release (8.0, 9.0 or 9.1). Off when "
+            "not given.",
+            exists=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
     verify_only: bool = typer.Option(
         False,
         "--verify-only",
@@ -389,6 +403,7 @@ def main(
                 offline_depot_password=offline_depot_password,
                 offline_depot_port=offline_depot_port,
                 nested_nsx_vdr_mac=nested_nsx_vdr_mac,
+                balloon_driver_vib=balloon_driver_vib,
                 verify_only=verify_only,
             )
         )
@@ -997,6 +1012,7 @@ async def _deploy_entry(
     offline_depot_password: str = None,
     offline_depot_port: int = 443,
     nested_nsx_vdr_mac: str = "02:50:56:42:42:42",
+    balloon_driver_vib: Path = None,
     verify_only: bool = False,
 ):
     """
@@ -1126,21 +1142,25 @@ async def _deploy_entry(
         #
         # This step needs SSH on the ESXi hosts, but the VCF Installer disables
         # ESXi SSH once a validation/deployment POST has been issued. On a retry
-        # of a deployment that already reached that point, the VIB is already
-        # installed — skip it rather than fail on a closed SSH port.
-        if is_vcf91(vcf_json):
-            if await sddc_operation_started(vcf_client):
-                console.print(
-                    "[cyan]ℹ️ Existing validation/deployment detected — "
-                    "skipping vSAN ESA mock-HW VIB install (ESXi SSH is "
-                    "disabled once VCF deployment has started).[/cyan]"
-                )
-            else:
-                await install_vsan_esa_mock_vib(vcf_json, zpod)
+        # of a deployment that already reached that point, the VIBs are already
+        # installed — skip them rather than fail on a closed SSH port.
+        sddc_started = (is_vcf91(vcf_json) or balloon_driver_vib) and (
+            await sddc_operation_started(vcf_client)
+        )
+        if sddc_started:
+            console.print(
+                "[cyan]ℹ️ Existing validation/deployment detected — "
+                "skipping ESXi VIB installs (ESXi SSH is "
+                "disabled once VCF deployment has started).[/cyan]"
+            )
+        elif is_vcf91(vcf_json):
+            await install_vsan_esa_mock_vib(vcf_json, zpod)
         else:
             console.print(
-                "[green]✓ No ESXi host preparation required (VCF 9.0.x)[/green]"
+                "[green]✓ No vSAN ESA mock-HW VIB required (VCF 9.0.x)[/green]"
             )
+        if balloon_driver_vib and not sddc_started:
+            await install_balloon_driver(vcf_json, zpod, balloon_driver_vib)
 
         phase_banner(4, "Configuring DNS records")
         configure_dns(zpod_client, zpod_name, vcf_json, hostname_ip_mapping)
@@ -1846,6 +1866,128 @@ async def install_vsan_esa_mock_vib(vcf_json: dict, zpod: dict):
     if failures:
         console.print(
             f"[bold red]❌ vSAN ESA mock-HW VIB install failed on: "
+            f"{', '.join(failures)}[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+
+# zNestedBalloon balloon driver (opt-in, --balloon-driver-vib). The VIB ships
+# the zballoon vmkernel module plus a boot script that loads it on every boot
+# of a VMware-VM host; we load it once by hand since no reboot follows.
+BALLOON_VIB_NAME = "zballoon"
+BALLOON_MODULE = "zballoon"
+
+
+async def _install_balloon_on_host(
+    hostname: str, password: str, vib_path: Path
+) -> str:
+    """Install the zballoon VIB and load its module on one ESXi host over SSH.
+
+    Returns the latest 'zballoon: running' vmkernel.log line. Raises
+    RuntimeError on any failure, including a module that did not load.
+    """
+    import asyncssh  # lazy import, matches _install_vib_on_host's pattern
+
+    async def run(conn, cmd, check=True):
+        if global_debug:
+            debug_console.print(f"[dim]{hostname}: {cmd}[/dim]")
+        result = await conn.run(cmd, check=False, timeout=180)
+        if global_debug and result.stdout:
+            debug_console.print(
+                f"[dim]{hostname} stdout: {result.stdout.strip()}[/dim]"
+            )
+        if check and result.exit_status != 0:
+            raise RuntimeError(
+                f"command failed (exit {result.exit_status}): {cmd}\n"
+                f"{(result.stderr or result.stdout or '').strip()}"
+            )
+        return result
+
+    try:
+        async with asyncssh.connect(
+            hostname,
+            username="root",
+            password=password,
+            known_hosts=None,  # nested ESXi host keys are ephemeral
+            login_timeout=30,
+        ) as conn:
+            secure_boot = await run(conn, "esxcli system settings encryption get")
+            if "Require Secure Boot: true" in secure_boot.stdout:
+                raise RuntimeError(f"Secure Boot is required; {BALLOON_MODULE} cannot load")
+
+            installed = await run(
+                conn, f"esxcli software vib list | grep -i {BALLOON_VIB_NAME}",
+                check=False,
+            )
+            if installed.exit_status != 0:
+                await asyncssh.scp(vib_path, (conn, "/tmp/zballoon.vib"))
+                await run(
+                    conn,
+                    "esxcli software acceptance set --level CommunitySupported",
+                )
+                await run(
+                    conn,
+                    "esxcli software vib install -v /tmp/zballoon.vib "
+                    "--no-sig-check",
+                )
+
+            loaded_cmd = f"vmkload_mod -l | grep '^{BALLOON_MODULE} '"
+            if (await run(conn, loaded_cmd, check=False)).exit_status != 0:
+                await run(conn, f"vmkload_mod {BALLOON_MODULE}")
+            await run(conn, loaded_cmd)
+
+            # The module logs its 'running' line right after it starts.
+            for _ in range(10):
+                log = await run(
+                    conn,
+                    f"grep '{BALLOON_MODULE}: running' /var/log/vmkernel.log "
+                    "| tail -1",
+                    check=False,
+                )
+                if log.stdout.strip():
+                    return log.stdout.strip()
+                await asyncio.sleep(3)
+            raise RuntimeError(
+                f"{BALLOON_MODULE} loaded but no '{BALLOON_MODULE}: running' "
+                "line in /var/log/vmkernel.log"
+            )
+    except asyncssh.Error as e:
+        raise RuntimeError(f"SSH error on {hostname}: {e}") from e
+    except OSError as e:
+        raise RuntimeError(f"connection to {hostname} failed: {e}") from e
+
+
+async def install_balloon_driver(vcf_json: dict, zpod: dict, vib_path: Path):
+    """Install the zNestedBalloon VIB on every ESXi host of the template and
+    load zballoon. Fails the deploy if any host does not end up running it."""
+    hostnames = [
+        h["hostname"] for h in vcf_json.get("hostSpecs", []) if h.get("hostname")
+    ]
+    if not hostnames:
+        console.print("[yellow]⚠️ No ESXi hosts found in template[/yellow]")
+        return
+
+    console.print(
+        f"[bold cyan]🎈 Installing zNestedBalloon driver ({vib_path.name}) on "
+        f"{len(hostnames)} ESXi host(s)...[/bold cyan]"
+    )
+    password = zpod.get("password", "")
+    results = await asyncio.gather(
+        *(_install_balloon_on_host(h, password, vib_path) for h in hostnames),
+        return_exceptions=True,
+    )
+
+    failures = []
+    for hostname, result in zip(hostnames, results):
+        if isinstance(result, Exception):
+            console.print(f"  [red]✗[/red] {hostname}: {result}")
+            failures.append(hostname)
+        else:
+            console.print(f"  [green]✓[/green] {hostname}: {result}")
+
+    if failures:
+        console.print(
+            f"[bold red]❌ zNestedBalloon driver install failed on: "
             f"{', '.join(failures)}[/bold red]"
         )
         raise typer.Exit(code=1)
