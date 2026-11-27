@@ -27,6 +27,9 @@ a reader, not the digit.
   acceptance, one build per ESXi release), installs it, loads the `zballoon` module and fails
   the deploy if the module or its `running` log line is missing. Why: lets the physical host
   reclaim memory that sits free inside nested hosts.
+- **`config/v9.1-latest_std_3hosts-ftt0.json`**, the `v9.1-latest` template with vSAN
+  `failuresToTolerate: 0`, so the deployer's vSAN ESA FTT=0 workaround applies. Why: a nested
+  lab asks for FTT=0, and this saves editing the template by hand.
 
 ### Fixed
 
@@ -52,6 +55,9 @@ a reader, not the digit.
   in from the sibling repo's workflow; nothing pins it there — GitHub-hosted runners already
   clear `v5`'s Node 24 requirement, and neither workflow checks out a fork PR, which is the one
   behavior `v7` changes.
+- **`v9.1-latest` targets VCF 9.1.2.0**, up from 9.1.1.0. Why: 9.1.2 is the newest
+  maintenance release of the 9.1.x line, and the template's top-level `version` is not
+  auto-discovered.
 
 ## [0.1.0] — 2026-09-28
 
