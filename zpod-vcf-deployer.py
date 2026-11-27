@@ -1446,7 +1446,8 @@ async def deploy_zpod(
 
             live.update(gather_zpod_info(zpod), refresh=True)
             status = zpod["status"]
-            if status not in ("BUILDING", "PENDING"):
+            # In-progress statuses, as zpodcli lists them (zpodcli/lib/utils.py).
+            if status not in ("PENDING", "BUILDING", "POST_SCRIPTS", "CONFIG_SCRIPTS"):
                 break
             await asyncio.sleep(10)
 

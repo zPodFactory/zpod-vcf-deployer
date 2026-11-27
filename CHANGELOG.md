@@ -37,6 +37,9 @@ a reader, not the digit.
   hardcoded `vcsa` and `nsx`, so a template renaming either got a false "vcsa unreachable"
   warning, or an NSX MAC fix that never found its manager. It now reads `vcenterHostname`
   and the NSX `vipFqdn`.
+- **zPod deploy waits through `CONFIG_SCRIPTS` and `POST_SCRIPTS`.** It stopped with
+  "Unexpected status: CONFIG_SCRIPTS" as soon as zPodFactory began running its scripts. Why: the
+  wait loop only knew `PENDING` and `BUILDING`, while zPodFactory has two more in-progress phases.
 
 ### Changed
 
