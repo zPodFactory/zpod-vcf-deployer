@@ -48,6 +48,10 @@ a reader, not the digit.
   repository, with a configuration block at the top; `tools/README.md` explains the release in a
   page. The workflow re-checks before publishing. Why: six repositories had four variants of the
   same idea.
+- **CI checks out with `actions/checkout@v7`**, up from `v4`. Why: `v4` was just what got copied
+  in from the sibling repo's workflow; nothing pins it there — GitHub-hosted runners already
+  clear `v5`'s Node 24 requirement, and neither workflow checks out a fork PR, which is the one
+  behavior `v7` changes.
 
 ## [0.1.0] — 2026-09-28
 
