@@ -30,7 +30,7 @@ from typing_extensions import Annotated
 
 load_dotenv()
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 app = typer.Typer(
     help="zPod VCF Deployer - Unified deployment and VCF depot management tool",

@@ -20,6 +20,8 @@ a reader, not the digit.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-11-27
+
 ### Added
 
 - **`--balloon-driver-vib PATH` installs the zNestedBalloon driver on every nested ESXi host.**
